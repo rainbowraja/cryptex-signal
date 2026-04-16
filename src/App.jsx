@@ -341,6 +341,117 @@ function validatePw(p){
   if(!/[!@#$%^&*_\-]/.test(p))e.push("symbol");
   return e;
 }
+
+// Disposable / fake email domain blocklist
+const FAKE_DOMAINS=[
+  "mailinator.com","guerrillamail.com","10minutemail.com","temp-mail.org","throwaway.email",
+  "yopmail.com","maildrop.cc","trashmail.com","sharklasers.com","guerrillamailblock.com",
+  "grr.la","guerrillamail.info","guerrillamail.biz","guerrillamail.de","guerrillamail.net",
+  "guerrillamail.org","spam4.me","trashmail.at","trashmail.io","trashmail.me","trashmail.net",
+  "fakeinbox.com","tempmail.com","dispostable.com","mailnull.com","spamgourmet.com",
+  "spamspot.com","spamgourmet.net","spamgourmet.org","spam.la","bugmenot.com","notmailinator.com",
+  "tempinbox.com","spamfree24.org","mailexpire.com","discardmail.com","discardmail.de",
+  "spamhole.com","jetable.fr","noref.in","nus.edu.sg","discard.email","gtrash.com",
+  "binkmail.com","bobmail.info","chammy.info","devnullmail.com","get1mail.com","getonemail.net",
+  "hailmail.net","ichimail.com","inoutmail.de","inoutmail.eu","inoutmail.info","inoutmail.net",
+  "internet-e-mail.de","internet-mail.org","internetemails.net","internetmailing.net",
+  "junk1.tk","kasmail.com","kaspop.com","klassmaster.com","klassmaster.net","klassmaster.org",
+  "lol.ovpn.to","lovemeleaveme.com","lr78.com","lukop.dk","m4ilweb.info","mail.mezimages.net",
+  "mail2rss.org","mail4trash.com","mailbidon.com","mailbiz.biz","mailblocks.com",
+  "mailc.net","mailcat.biz","mailcatch.com","maildu.de","maileater.com","mailer.net",
+  "mailexpire.com","mailfa.tk","mailforspam.com","mailfreeonline.com","mailguard.me",
+  "mailimate.com","mailin8r.com","mailinator2.com","mailincubator.com","mailismagic.com",
+  "mailme.lv","mailme24.com","mailmetrash.com","mailmoat.com","mailnew.com",
+  "mailnull.com","mailquack.com","mailscrap.com","mailshell.com","mailsiphon.com",
+  "mailslapping.com","mailslite.com","mailsou.com","mailspam.me","mailsream.com",
+  "mailtemporaire.com","mailtemporaire.fr","mailthunder.net","mailtome.de",
+  "mailtothis.com","mailtrash.net","mailtv.net","mailzilla.com","makemetheking.com",
+  "manybrain.com","mbx.cc","meltmail.com","messagebeamer.de","mezimages.net",
+  "mierdamail.com","mintemail.com","moncourrier.fr.nf","monemail.fr.nf","monmail.fr.nf",
+  "mt2009.com","mt2014.com","mypartyclip.de","myphantomemail.com","myspaceinc.com",
+  "myspaceinc.net","myspaceinc.org","myspacepimpedup.com","myspamless.com","mytrashmail.com",
+  "neomailbox.com","nepwk.com","nervmich.net","nervtmich.net","netviewer-france.com",
+  "neverbox.com","nice-coment.com","no-spam.ws","nobulk.com","noclickemail.com",
+  "nogmailspam.info","nojunk.com","nonspam.eu","nonspammer.de","noref.in",
+  "nospam.ze.tc","nospam4.us","nospamfor.us","nospammail.net","nospamthanks.info",
+  "notmailinator.com","nowmymail.com","nwldx.com","objectmail.com","obobbo.com",
+  "odnorazovoe.ru","oneoffmail.com","onewaymail.com","onlatedotcom.info","online.ms",
+  "oopi.org","owlpic.com","pancakemail.com","paplease.com","pcusers.otherinbox.com",
+  "pepbot.com","peterdethier.com","petml.com","pfui.ru","pookmail.com",
+  "privacy.net","proxymail.eu","prtnx.com","prtz.eu","punkass.com","put2.net",
+  "qq.com","recode.me","recursor.net","recyclemail.dk","regbypass.comsafe-mail.net",
+  "regexmail.com","rklips.com","rmqkr.net","rppkn.com","rtrtr.com",
+  "s0ny.net","safe-mail.net","safetymail.info","safetypost.de","sandelf.de",
+  "saynotospams.com","scatmail.com","schachrol.com","schrott-email.de","secretemail.de",
+  "secure-email.org","selfdestructingmail.com","senseless-entertainment.com",
+  "services391.com","sharklasers.com","shiftmail.com","shitmail.me","shitmail.org",
+  "shitware.nl","skeefmail.com","slapsfromlastnight.com","slopsbox.com",
+  "slushmail.com","smellfear.com","snakemail.com","sneakemail.com","snkmail.com",
+  "sofimail.com","sofort-mail.de","sogetthis.com","soodonims.com",
+  "spam.la","spam.su","spam4.me","spamavert.com","spambox.info",
+  "spambox.irishspringrealty.com","spambox.us","spamcannon.com","spamcannon.net",
+  "spamcero.com","spamcon.org","spamcorptastic.com","spamcowboy.com","spamcowboy.net",
+  "spamcowboy.org","spamday.com","spamdecoy.net","spamex.com","spamfree24.org",
+  "spamgoes.in","spamgourmet.com","spamgourmet.net","spamgourmet.org",
+  "spamherelots.com","spamhereplease.com","spamhole.com","spamify.com",
+  "spaminator.de","spamkill.info","spaml.com","spaml.de","spammotel.com",
+  "spammy.host","spamoff.de","spamslicer.com","spamspot.com","spamstack.net",
+  "spamthis.co.uk","spamthisplease.com","spamtrail.com","spamtrap.ro",
+  "spamtroll.net","spamwc.de","spamwc.net","spamwc.org","speed.1s.fr",
+  "super-auswahl.de","supergreatmail.com","supermailer.jp","superrito.com",
+  "superstachel.de","suremail.info","susi.ml","svk.jp","sweetxxx.de",
+  "tafmail.com","tagyourself.com","tapchicuocsong.vn","teewars.org",
+  "teleworm.com","teleworm.us","temp-mail.ru","tempail.com","tempalias.com",
+  "tempe-mail.com","tempemail.biz","tempemail.co.za","tempemail.com",
+  "tempemail.net","tempinbox.co.uk","tempinbox.com","tempmail.eu",
+  "tempmail.it","tempmail2.com","tempr.email","tempsky.com","tempthe.net",
+  "tempymail.com","thanksnospam.info","thc.st","thetrash.email",
+  "thinmastermail.com","throwam.com","throwam.net","throwapp.org",
+  "throwaway.email","throwawaymailaddress.com","throwmail.org","tilien.com",
+  "tmail.com","tmail.ws","tmailinator.com","toiea.com","toomail.biz",
+  "topranklist.de","tradermail.info","trash-mail.at","trash-mail.cf",
+  "trash-mail.ga","trash-mail.gq","trash-mail.io","trash-mail.ml",
+  "trash-mail.tk","trash2009.com","trash2010.com","trash2011.com",
+  "trashdevil.com","trashdevil.de","trashemail.de","trashimail.de",
+  "trashmail.at","trashmail.com","trashmail.de","trashmail.io",
+  "trashmail.me","trashmail.net","trashmail.org","trashmail.xyz",
+  "trashmailer.com","trashmailer.org","trashnet.net","trox.in",
+  "trungtamgiasu.vn","turoid.com","turual.com","twinmail.de","tyldd.com",
+  "uggsrock.com","umail.net","unmail.ru","uroid.com","us.af",
+  "venompen.com","veryday.ch","veryrealemail.com","viditag.com",
+  "viewcastmedia.com","viewcastmedia.net","viewcastmedia.org",
+  "vinernet.com","vipmail.name","vipmail.pw","vkcode.ru",
+  "vomoto.com","vpn.st","vsimcard.com","vubby.com","wasteland.rfc822.org",
+  "webemail.me","webm4il.info","webm4il.net","weg-werf-email.de",
+  "wegwerf-emails.de","wegwerfadresse.de","wegwerfemail.com","wegwerfemail.de",
+  "wegwerfemail.info","wegwerfemail.net","wegwerfemail.org","wegwerfmail.de",
+  "wegwerfmail.info","wegwerfmail.net","wegwerfmail.org","weidner.com",
+  "welovefilm.com","whatiaas.com","whatisaas.com","whopy.com",
+  "wilemail.com","willhackforfood.biz","willselldrugs.com","willsell.org",
+  "wmail.cf","wollan.info","wwwnew.eu","xagloo.com","xemaps.com",
+  "xents.com","xmaily.com","xoxy.net","xyzfree.net","yapped.net",
+  "yarnpedia.ga","yeah.net","yep.it","yertxenor.com","yomail.info",
+  "yopmail.com","yopmail.fr","yopmail.pp.ua","you-spam.com","yourlms.biz",
+  "ypmail.webarnak.fr.eu.org","yuurok.com","z1p.biz","zebins.com",
+  "zebins.eu","zehnminutenmail.de","zippymail.info","zoaxe.com","zoemail.net",
+  "zoemail.org","zomg.info"
+];
+
+function validateEmail(email){
+  const e=email.toLowerCase().trim();
+  // Basic format check
+  const emailRegex=/^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/;
+  if(!emailRegex.test(e)) return{ok:false,err:"Enter a valid email address."};
+  const domain=e.split("@")[1];
+  // Block disposable domains
+  if(FAKE_DOMAINS.includes(domain)) return{ok:false,err:"Disposable/temporary emails not allowed. Use your real email address."};
+  // Block domains with no TLD > 2 chars that look fake
+  const tld=domain.split(".").pop();
+  if(tld.length<2) return{ok:false,err:"Invalid email domain."};
+  // Block single-character local parts
+  if(e.split("@")[0].length<3) return{ok:false,err:"Email address too short."};
+  return{ok:true};
+}
 const Auth={
   check:(cqid,pass)=>{
     if(btoa(cqid)===CFG._a&&btoa(pass)===CFG._b)return{ok:true,role:"admin",plan:"elite",email:"admin",cqid};
@@ -352,6 +463,7 @@ const Auth={
     }catch{return{ok:false,err:"Login failed."};}
   },
   register:(email,pass)=>{
+    const ev=validateEmail(email);if(!ev.ok)return{ok:false,err:ev.err};
     const errs=validatePw(pass);if(errs.length)return{ok:false,err:"Password needs: "+errs.join(", ")};
     try{
       const users=JSON.parse(localStorage.getItem("cx_users")||"[]");
@@ -554,7 +666,7 @@ function LockBar({sig}){
 }
 
 // ── SIGNAL CARD ───────────────────────────────────────────────────
-function SignalCard({coinId,name,sig,loading,onRefresh}){
+function SignalCard({coinId,name,sig,loading,onRefresh,livePrice,liveChg}){
   if(loading)return<div className="card" style={{padding:52,textAlign:"center"}}><Spin sz={48}/><div style={{marginTop:16,color:"var(--c)",fontFamily:"'Barlow Condensed',sans-serif",fontSize:15,letterSpacing:2}}>QUANTITATIVE ANALYSIS IN PROGRESS...</div><div style={{marginTop:8,color:"var(--text2)",fontSize:12}}>Multi-timeframe synchronization · Triple confirmation</div></div>;
   if(!sig||sig.noSignal)return(<div className="card" style={{padding:28,border:"1px solid rgba(255,204,0,.2)"}}>
     <div style={{fontSize:40,marginBottom:10}}>⏳</div>
@@ -584,8 +696,13 @@ function SignalCard({coinId,name,sig,loading,onRefresh}){
             {name||coinId} &nbsp;·&nbsp; {sig.tf} &nbsp;·&nbsp; Leverage&nbsp;<span className="mono" style={{color:"var(--y)",fontWeight:700}}>{sig.lev}×</span>
             &nbsp;·&nbsp; HTF <span style={{color:ind?.htfTrend==="UP"?"var(--g)":"var(--r)",fontWeight:700}}>{ind?.htfTrend}</span>
           </div>
-          <div className="mono" style={{fontSize:24,fontWeight:700,color:"var(--text)"}}>${fp(sig.price)}</div>
-          {sig.volatileMarket&&<div style={{marginTop:8,padding:"6px 12px",background:"rgba(255,32,82,.1)",borderRadius:8,border:"1px solid rgba(255,32,82,.25)",fontSize:12,color:"var(--r)",display:"flex",alignItems:"center",gap:8}}>
+          <div style={{display:"flex",alignItems:"baseline",gap:12,flexWrap:"wrap",marginBottom:4}}>
+            <div className="mono" style={{fontSize:24,fontWeight:700,color:"var(--text)"}}>${fp(livePrice||sig.price)}</div>
+            {liveChg!==undefined&&<span style={{fontSize:14,color:liveChg>=0?"var(--g)":"var(--r)",fontWeight:600}}>{liveChg>=0?"+":""}{liveChg.toFixed(2)}%</span>}
+            {livePrice&&livePrice!==sig.price&&<span style={{fontSize:10,color:"var(--text2)",padding:"2px 8px",background:"var(--bg3)",borderRadius:20,border:"1px solid var(--bdr)",fontFamily:"'Barlow Condensed',sans-serif"}}>Signal at ${fp(sig.price)}</span>}
+            <span style={{width:8,height:8,borderRadius:"50%",background:"var(--g)",display:"inline-block",boxShadow:"0 0 6px var(--g)",flexShrink:0}} className="_pu" title="Live price"/>
+          </div>
+          {sig.volatileMarket&&<div style={{marginTop:4,padding:"6px 12px",background:"rgba(255,32,82,.1)",borderRadius:8,border:"1px solid rgba(255,32,82,.25)",fontSize:12,color:"var(--r)",display:"flex",alignItems:"center",gap:8}}>
             <span>⚠️</span><span>HIGH VOLATILITY — Reduce position size, widen stops by 20%</span>
           </div>}
         </div>
@@ -891,7 +1008,7 @@ function PageSignals({coins,sigs,loadSig,active,setActive,st,setSt,onRefresh}){
       <button className={`stab-btn ${st==="day"?"ad":""}`}   onClick={()=>setSt("day")}>📊 DAY</button>
       <button className={`stab-btn ${st==="swing"?"aw":""}`} onClick={()=>setSt("swing")}>🌊 SWING</button>
     </div>
-    <SignalCard coinId={cd.id} name={cd.name} sig={sig} loading={loadSig&&!sig} onRefresh={onRefresh}/>
+    <SignalCard coinId={cd.id} name={cd.name} sig={sig} loading={loadSig&&!sig} onRefresh={onRefresh} livePrice={coin.updatedAt?coin.price:undefined} liveChg={coin.updatedAt?coin.chg24:undefined}/>
   </div>);
 }
 
@@ -912,7 +1029,7 @@ function PageScan(){
   const longs=results.filter(r=>r.signal==="LONG").length;const shorts=results.filter(r=>r.signal==="SHORT").length;
 
   if(view)return(<div><button className="btn btn-h" style={{marginBottom:16}} onClick={()=>setView(null)}>← Back to Scan</button>
-    <SignalCard coinId={view.coinId} name={view.coinId} sig={view} loading={false} onRefresh={()=>setView(null)}/></div>);
+    <SignalCard coinId={view.coinId} name={view.coinId} sig={view} loading={false} onRefresh={()=>setView(null)} livePrice={view.price} liveChg={view.chg24}/></div>);
 
   return(<div>
     <div style={{marginBottom:20}}>
@@ -1068,7 +1185,7 @@ function PageSearch(){
         <button className={`stab-btn ${vst==="day"?"ad":""}`} onClick={()=>setVst("day")}>📊 DAY</button>
         <button className={`stab-btn ${vst==="swing"?"aw":""}`} onClick={()=>setVst("swing")}>🌊 SWING</button>
       </div>
-      <SignalCard coinId={coinData.id} name={coinData.id} sig={sigs[vst]} loading={false} onRefresh={()=>select(sel)}/>
+      <SignalCard coinId={coinData.id} name={coinData.id} sig={sigs[vst]} loading={false} onRefresh={()=>select(sel)} livePrice={coinData.price} liveChg={coinData.chg24}/>
     </div>}
   </div>);
 }
