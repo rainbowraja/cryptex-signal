@@ -73,8 +73,8 @@
         const CFG = {
             ADMIN: { user: "admin@cryptexquant.io", pass: "CQ@Admin#2024!Ultra" },
             WALLET: "TNfi3K9XXjFNFND1dVhRasokcaegCQeXc3",
-            TG_TOKEN: 'YOUR_BOT_TOKEN', // bot token here
-            TG_CHAT_ID: 'YOUR_CHAT_ID',   // chat id here
+            TG_TOKEN: '8723413594:AAHHUzIaMTtDpwviioCaxfJSQB_M56-KYe0', // bot token here
+            TG_CHAT_ID: '668488340',   // chat id here
             MIN_CONF: 70
         };
 
@@ -265,4 +265,4 @@
     </script>
 </body>
 </html>
-       
+                                       
