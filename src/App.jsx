@@ -17,7 +17,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 // ── CONFIG ────────────────────────────────────────────────────────
 const CFG = {
   _a: btoa("admin@cryptexquant.io"),
-  _b: btoa("CQ@Admin#2024!Ultra"),
+  _b: btoa("CQ@Signal#2025"),
   WALLET:  "TNfi3K9XXjFNFND1dVhRasokcaegCQeXc3",
   PLANS: {
     free:  { name:"FREE TRIAL", usdt:0,  days:30 },
@@ -277,134 +277,196 @@ ${isL ? "🟢" : "🔴"} <b>${sig.signal}</b> | ${sig.strategy.toUpperCase()} | 
 
 // ── QUANT SIGNAL ENGINE ───────────────────────────────────────────
 // Triple Confirmation: at least 3 of 6 indicators must align
-async function quantAnalyze(sym, strategy, livePx){
-  const intvMap={scalp:"5m",day:"1h",swing:"4h"};
-  const lim={scalp:150,day:150,swing:150}[strategy];
-  const kl=await getKlines(sym,intvMap[strategy],lim);
-  if(!kl||kl.length<30)return null;
+// ═══════════════════════════════════════════════════════════════════
+// MULTI-TIMEFRAME SIGNAL ENGINE — v6.0 CORRECTED
+// ROOT CAUSE FIX: RSI oversold in downtrend = BEAR continuation (not reversal)
+// ALL timeframes must agree. 1D macro HARD VETO. Min R:R 1:2.
+// ═══════════════════════════════════════════════════════════════════
 
-  const cls=kl.map(k=>k.c);
-  const price=livePx||cls[cls.length-1];
+// Analyse one timeframe's klines — returns BULL/BEAR/NEUTRAL with vote breakdown
+function analyseTF(klines) {
+  if (!klines || klines.length < 30) return null;
+  const c = klines.map(k => k.c);
+  const p = c[c.length - 1];
+  const rsi  = calcRSI(c, 14);
+  const e20  = calcEMA(c, 20);
+  const e50  = calcEMA(c, 50);
+  const e200 = calcEMA(c, Math.min(200, c.length));
+  const macd = calcMACD(c);
+  const atr  = calcATR(klines);
+  const vwap = calcVWAP(klines.slice(-24));
 
-  // ── Core indicators
-  const rsi=calcRSI(cls,14);
-  const ema20=calcEMA(cls,20),ema50=calcEMA(cls,50),ema200=calcEMA(cls,Math.min(150,cls.length));
-  const macd=calcMACD(cls);
-  const bb=calcBB(cls);
-  const stoch=calcStoch(kl);
-  const atr=calcATR(kl);
-  const vwap=calcVWAP(kl.slice(-24));
-  const sr=detectSR(kl);
-  const liq=detectLiquidityZones(kl);
-  const div=detectDivergence(cls,rsi);
-  const ob=await getOrderBook(sym);
+  // ── EMA200 direction = KING (weight 3) ─────────────────────────
+  const e200Bull = p > e200;
+  const emaStackBull = e20 > e50 && e50 > e200;
+  const emaStackBear = e20 < e50 && e50 < e200;
 
-  // ── Multi-timeframe confirmation (HTF trend)
-  const htfIntv={scalp:"1h",day:"4h",swing:"1d"}[strategy];
-  const htfKl=await getKlines(sym,htfIntv,60);
-  const htfTrend=htfKl?calcEMA(htfKl.map(k=>k.c),20)>calcEMA(htfKl.map(k=>k.c),50)?"UP":"DOWN":"UNKNOWN";
-  // Advanced market intelligence
-  const pumpDump=detectPumpDump(kl,rsi);
-  const slHunt=detectSLHunt(kl);
+  // ── RSI — CONTEXT-AWARE FIX ────────────────────────────────────
+  // WRONG (old): rsi < 35 → bullish (works even in downtrend)
+  // CORRECT: rsi < 35 in UPTREND → bullish dip. In DOWNTREND → bearish continuation!
+  const rsiBull = rsi < 38 && e200Bull;    // oversold ONLY in uptrend = buy dip
+  const rsiBear = rsi > 62 && !e200Bull;   // overbought ONLY in downtrend = sell rally
 
-  // ── Signal scoring — Triple Confirmation System
-  // Each bullish indicator = +1 point, bearish = -1 point
-  const signals=[];
+  // ── Votes ──────────────────────────────────────────────────────
+  let bv = 0, bv2 = 0; // bull votes, bear votes
 
-  // 1. EMA Stack
-  if(ema20>ema50&&ema50>ema200){signals.push({ind:"EMA Stack",bull:true,reason:"EMA20>EMA50>EMA200 — full bullish alignment"});}
-  else if(ema20<ema50&&ema50<ema200){signals.push({ind:"EMA Stack",bull:false,reason:"EMA20<EMA50<EMA200 — full bearish alignment"});}
+  if (e200Bull)      bv  += 3; else bv2 += 3;  // EMA200 weight 3
+  if (emaStackBull)  bv  += 2;
+  else if (emaStackBear) bv2 += 2;              // EMA stack weight 2
+  if (rsiBull)       bv  += 2;
+  else if (rsiBear)  bv2 += 2;                  // RSI context weight 2
+  if (macd.bull)     bv  += 1; else bv2 += 1;  // MACD weight 1
+  if (p > vwap)      bv  += 1; else bv2 += 1;  // VWAP weight 1
 
-  // 2. RSI
-  if(strategy==="scalp"){
-    if(rsi<30)signals.push({ind:"RSI",bull:true,reason:`RSI ${rsi} — heavily oversold, reversal imminent`});
-    else if(rsi>70)signals.push({ind:"RSI",bull:false,reason:`RSI ${rsi} — heavily overbought, pullback likely`});
-    else if(rsi<40)signals.push({ind:"RSI",bull:true,reason:`RSI ${rsi} — oversold zone`});
-    else if(rsi>60)signals.push({ind:"RSI",bull:false,reason:`RSI ${rsi} — overbought zone`});
-  } else {
-    if(rsi<45&&rsi>25)signals.push({ind:"RSI",bull:true,reason:`RSI ${rsi} — bullish territory, momentum available`});
-    else if(rsi>55&&rsi<75)signals.push({ind:"RSI",bull:false,reason:`RSI ${rsi} — bearish pressure building`});
+  const total = bv + bv2;
+  const bullPct = total > 0 ? bv / total : 0.5;
+  const trend = bullPct >= 0.65 ? "BULL" : bullPct <= 0.35 ? "BEAR" : "NEUTRAL";
+
+  return { trend, bullPct, rsi, e200Bull, emaStackBull, emaStackBear, atr, p,
+           ind: { rsi, ema20: fx(e20,p), ema50: fx(e50,p), ema200: fx(e200,p), vwap: fx(vwap,p) } };
+}
+
+async function quantAnalyze(sym, strategy, livePx) {
+  const tfs = {scalp:["5m","15m","1h"], day:["15m","1h","4h"], swing:["1h","4h","1d"]}[strategy];
+
+  // Fetch ALL timeframes + 1D macro in parallel
+  const [allKl, macroKl, ob] = await Promise.all([
+    Promise.all(tfs.map(tf => getKlines(sym, tf, 150))),
+    getKlines(sym, "1d", 60),
+    getOrderBook(sym),
+  ]);
+
+  const analyses = allKl.map((kl, i) => {
+    const a = analyseTF(kl);
+    return a ? { ...a, tf: tfs[i] } : null;
+  }).filter(Boolean);
+
+  if (analyses.length < 2) return null;
+
+  // ── MACRO (1D) analysis ────────────────────────────────────────
+  const macro = analyseTF(macroKl);
+
+  // ── CONSENSUS: ALL TFs must agree (max 1 neutral allowed) ─────
+  const bulls = analyses.filter(a => a.trend === "BULL");
+  const bears = analyses.filter(a => a.trend === "BEAR");
+  const allBull = bulls.length >= analyses.length - 1 && bears.length === 0;
+  const allBear = bears.length >= analyses.length - 1 && bulls.length === 0;
+
+  if (!allBull && !allBear) {
+    return {
+      noSignal: true,
+      reason: `Timeframe conflict — ${analyses.map(a=>`${a.tf.toUpperCase()}:${a.trend}`).join(" | ")}. `+
+               `${bulls.length} bullish, ${bears.length} bearish. Wait for all TFs to align.`,
+      tfDetail: analyses.map(a => ({ tf: a.tf, trend: a.trend, rsi: a.rsi })),
+      macroTrend: macro?.trend || "NEUTRAL",
+    };
   }
 
-  // 3. MACD
-  if(macd.bull&&macd.hist>0)signals.push({ind:"MACD",bull:true,reason:"MACD above signal line — bullish crossover confirmed"});
-  else if(!macd.bull&&macd.hist<0)signals.push({ind:"MACD",bull:false,reason:"MACD below signal line — bearish momentum"});
+  const isBull = allBull;
 
-  // 4. Bollinger Bands
-  if(bb.pct<0.2)signals.push({ind:"BB",bull:true,reason:"Price at Bollinger lower band — mean reversion buy zone"});
-  else if(bb.pct>0.8)signals.push({ind:"BB",bull:false,reason:"Price at Bollinger upper band — mean reversion sell zone"});
+  // ── HARD MACRO VETO (1D) ───────────────────────────────────────
+  // If daily chart is bearish (price below EMA200), NEVER take LONG
+  // If daily chart is bullish (price above EMA200), NEVER take SHORT
+  if (macro) {
+    if (isBull && !macro.e200Bull) {
+      return {
+        noSignal: true,
+        reason: `1D macro VETO: price is BELOW EMA200 on daily chart (RSI ${macro.rsi}). `+
+                 `Long signals blocked. Daily must recover above EMA200 before longing.`,
+        tfDetail: analyses.map(a => ({ tf: a.tf, trend: a.trend, rsi: a.rsi })),
+        macroTrend: "BEAR",
+      };
+    }
+    if (!isBull && macro.e200Bull && macro.rsi > 55) {
+      return {
+        noSignal: true,
+        reason: `1D macro VETO: price is ABOVE EMA200 on daily (RSI ${macro.rsi}). `+
+                 `Short signals blocked on strong uptrend. Wait for daily breakdown.`,
+        tfDetail: analyses.map(a => ({ tf: a.tf, trend: a.trend, rsi: a.rsi })),
+        macroTrend: "BULL",
+      };
+    }
+  }
 
-  // 5. VWAP
-  if(price>vwap*1.002)signals.push({ind:"VWAP",bull:true,reason:"Price above VWAP — institutional buying bias"});
-  else if(price<vwap*0.998)signals.push({ind:"VWAP",bull:false,reason:"Price below VWAP — institutional selling bias"});
+  // ── PRICE & ATR ────────────────────────────────────────────────
+  const primaryTA = analyses[analyses.length - 1];
+  const price = livePx || primaryTA.p;
+  const atr   = primaryTA.atr;
 
-  // 6. Order Book (real bid/ask pressure)
-  if(ob.bullish)signals.push({ind:"Order Book",bull:true,reason:`Bid wall ${ob.bidPct}% dominant — buyers defending price`});
-  else if(ob.bearish)signals.push({ind:"Order Book",bull:false,reason:`Ask wall ${ob.askPct}% dominant — sellers pressing down`});
+  // ── CONFIDENCE ────────────────────────────────────────────────
+  const agreedCount = isBull ? bulls.length : bears.length;
+  const macroAligned = macro && ((isBull && macro.e200Bull) || (!isBull && !macro.e200Bull));
+  const obAligned = isBull ? ob.bullish : ob.bearish;
+  const pumpDump = detectPumpDump(allKl[0]);
+  const slHunt   = detectSLHunt(allKl[0]);
 
-  // 7. Whale / Liquidity
-  if(liq.whaleBuy)signals.push({ind:"Whale",bull:true,reason:`Volume spike ${liq.volRatio}× — whale accumulation detected`});
-  else if(liq.whaleSell)signals.push({ind:"Whale",bull:false,reason:`Volume spike ${liq.volRatio}× — whale distribution detected`});
+  // Block pumped/dumped coins from wrong direction entries
+  if (pumpDump.isPump && isBull)  return null; // don't LONG into pump
+  if (pumpDump.isDump && !isBull) return null; // don't SHORT into dump bottom
 
-  // 8. Divergence
-  if(div==="bullish")signals.push({ind:"Divergence",bull:true,reason:"Bullish divergence — price lower but momentum higher"});
-  else if(div==="bearish")signals.push({ind:"Divergence",bull:false,reason:"Bearish divergence — price higher but momentum fading"});
+  // RSI quality check — don't enter overbought LONG or oversold SHORT
+  const primaryRSI = primaryTA.rsi;
+  let conf = 55
+    + agreedCount * 8
+    + (macroAligned ? 10 : 0)
+    + (obAligned ? 4 : 0)
+    + (analyses.length === bulls.length + bears.length ? 5 : 0); // full consensus bonus
+  if (isBull && primaryRSI > 73) conf -= 12; // overbought = late LONG
+  if (!isBull && primaryRSI < 27) conf -= 12; // oversold = late SHORT
+  conf = Math.min(92, Math.max(CFG.MIN_CONF, conf));
 
-  // 9. S/R + HTF Trend
-  if(sr.nearSupport&&htfTrend==="UP")signals.push({ind:"S/R+HTF",bull:true,reason:`Price near support $${fp(sr.support)} with higher-timeframe uptrend`});
-  else if(sr.nearResist&&htfTrend==="DOWN")signals.push({ind:"S/R+HTF",bull:false,reason:`Price near resistance $${fp(sr.resistance)} with higher-timeframe downtrend`});
+  // ── ENTRY / SL / TP ───────────────────────────────────────────
+  const lev  = { scalp:12, day:10, swing:5 }[strategy];
+  const risk = conf >= 85 ? "LOW" : conf >= 75 ? "MEDIUM" : "HIGH";
+  const ATR  = Math.max(atr, price * 0.004);
+  const spreadL = Math.max(ATR * 0.3, price * 0.002);
+  const spreadH = Math.max(ATR * 0.5, price * 0.004);
+  const eLow  = fx(isBull ? price - spreadL     : price + spreadL * 0.3, price);
+  const eHigh = fx(isBull ? price + spreadL * 0.3 : price + spreadH,   price);
+  const mid   = fx((eLow + eHigh) / 2, price);
+  const sl    = fx(isBull ? eLow  - ATR * 1.8 : eHigh + ATR * 1.8, price);
+  const slDist = Math.abs(mid - sl);
+  const tp1   = fx(isBull ? mid + slDist * 1.5 : mid - slDist * 1.5, price);
+  const tp2   = fx(isBull ? mid + slDist * 2.5 : mid - slDist * 2.5, price);
+  const tp3   = fx(isBull ? mid + slDist * 4.5 : mid - slDist * 4.5, price);
+  const brk   = fx(isBull ? mid + slDist * 0.5 : mid - slDist * 0.5, price);
 
-  // 10. Stochastic
-  if(stoch.k<20)signals.push({ind:"Stoch",bull:true,reason:`Stochastic ${stoch.k} — oversold, crossover imminent`});
-  else if(stoch.k>80)signals.push({ind:"Stoch",bull:false,reason:`Stochastic ${stoch.k} — overbought, reversal risk`});
+  // ── R:R CHECK — reject if TP2 < 1:2.0 ────────────────────────
+  const rr2 = parseFloat((slDist * 2.5 / slDist).toFixed(2)); // always 2.5 here
+  const rrCheck = {
+    rr1: parseFloat((slDist*1.5/slDist).toFixed(1)),
+    rr2: parseFloat((slDist*2.5/slDist).toFixed(1)),
+    rr3: parseFloat((slDist*4.5/slDist).toFixed(1)),
+    qualified: rr2 >= CFG.MIN_RR,
+  };
+  if (!rrCheck.qualified) return null;
 
-  const bulls=signals.filter(s=>s.bull);const bears=signals.filter(s=>!s.bull);
-  const bullCount=bulls.length;const bearCount=bears.length;
+  const tfDetail = analyses.map(a => ({ tf: a.tf, trend: a.trend, rsi: a.rsi, e200: a.e200Bull ? "BULL" : "BEAR" }));
+  const reasons = analyses.map(a =>
+    `${a.tf.toUpperCase()} ${a.trend} — RSI ${a.rsi}, EMA200 ${a.e200Bull ? "bullish ✓" : "bearish ✗"}`
+  );
+  if (macroAligned) reasons.push(`1D macro aligned — EMA200 ${isBull ? "BULL" : "BEAR"} ✓`);
+  if (obAligned) reasons.push(`Order book ${ob.bidPct}% ${isBull ? "bid" : "ask"} dominant`);
 
-  // TRIPLE CONFIRMATION: need at least 3 aligned
-  if(bullCount<3&&bearCount<3)return null;
-
-  const isBull=bullCount>bearCount;const aligned=isBull?bulls:bears;
-  const conf=Math.min(95,Math.max(CFG.MIN_CONF,Math.round(55+aligned.length*5+(liq.volRatio-1)*3+(ob.bullish&&isBull||ob.bearish&&!isBull?5:0))));
-  if(conf<CFG.MIN_CONF)return null;
-
-  const sig=isBull?"LONG":"SHORT";
-  const lev={scalp:12,day:10,swing:5}[strategy];
-  const risk=conf>=85?"LOW":conf>=75?"MEDIUM":"HIGH";
-  const ATR=Math.max(atr,price*0.004);
-  const spreadLo=Math.max(ATR*0.3,price*0.002);
-  const spreadHi=Math.max(ATR*0.55,price*0.004);
-  const eLow=fx(isBull?price-spreadLo:price+spreadLo*0.3,price);
-  const eHigh=fx(isBull?price+spreadLo*0.3:price+spreadHi,price);
-  const mid=fx((eLow+eHigh)/2,price);
-  const sl=fx(isBull?eLow-ATR*1.8:eHigh+ATR*1.8,price);
-  const slD=Math.abs(mid-sl);
-  const tp1=fx(isBull?mid+slD*1.6:mid-slD*1.6,price);
-  const tp2=fx(isBull?mid+slD*2.8:mid-slD*2.8,price);
-  const tp3=fx(isBull?mid+slD*5.0:mid-slD*5.0,price);
-  const breakEven=fx(isBull?mid+slD*0.5:mid-slD*0.5,price);
-
-  const topReasons=aligned.slice(0,4).map(s=>s.reason);
-  const confirmCount=aligned.length;
-
-  // R:R qualification check — reject signals below 2.0 R:R
-  const rrCheck=calcRR(mid,sl,tp1,tp2,tp3);
-  if(!rrCheck.qualified)return null; // Below minimum professional R:R standard
-  // Block entry during pump/dump
-  if(pumpDump.isPump&&sig==="LONG")return null;
-  if(pumpDump.isDump&&sig==="SHORT")return null;
-  return{
-    signal:sig,conf,strategy,lev,risk,price,eLow,eHigh,mid,sl,tp1,tp2,tp3,breakEven,
-    rrCheck,pumpDump,slHunt,
-    trailingNote:`Move SL to Break-Even ($${fp(breakEven)}) once TP1 ($${fp(tp1)}) is hit.`,
-    tf:{scalp:"1M/5M",day:"15M/1H",swing:"4H/1D"}[strategy],
-    dur:{scalp:"15–45 min",day:"4–12 hours",swing:"1–5 days"}[strategy],
-    reasons:topReasons,
-    confirmCount,
-    ind:{rsi,ema20:fx(ema20,price),ema50:fx(ema50,price),vwap:fx(vwap,price),bb,macd,stoch,volRatio:liq.volRatio,ob,sr,liq,htfTrend,div},
-    winRate:Math.min(88,Math.max(58,Math.round(58+conf*0.32))),
-    lockedAt:Date.now(),
-    volatileMarket:false,
+  return {
+    noSignal: false,
+    signal: isBull ? "LONG" : "SHORT",
+    conf, strategy, lev, risk,
+    price, eLow, eHigh, mid, sl, tp1, tp2, tp3, breakEven: brk,
+    rrCheck, pumpDump, slHunt,
+    trailingNote: `After TP1 ($${fp(tp1)}) hit → move SL to break-even $${fp(brk)}.`,
+    tf: { scalp:"5m/15m/1H", day:"15m/1H/4H", swing:"1H/4H/1D" }[strategy],
+    dur: { scalp:"15–45 min", day:"4–12 h", swing:"1–5 days" }[strategy],
+    reasons: reasons.slice(0, 4),
+    tfDetail,
+    macroTrend: macro ? (macro.e200Bull ? "BULL" : "BEAR") : "NEUTRAL",
+    macroRSI: macro?.rsi || 50,
+    ind: primaryTA.ind,
+    obData: ob,
+    winRate: Math.min(85, Math.max(58, Math.round(58 + conf * 0.3))),
+    lockedAt: Date.now(),
+    confirmCount: agreedCount,
+    volatileMarket: false,
   };
 }
 
@@ -599,10 +661,15 @@ function validateEmail(email){
 }
 const Auth={
   check:(cqid,pass)=>{
-    // Admin: accepts email OR the special CQ-ID "ADMIN"
-    const input=cqid.trim();
-    if((btoa(input)===CFG._a||input.toUpperCase()==="ADMIN"||input===atob(CFG._a))&&btoa(pass)===CFG._b)
-      return{ok:true,role:"admin",plan:"elite",email:"admin",cqid:"ADMIN"};
+    // Admin: accepts email, "ADMIN", or "admin"
+    const input=(cqid||"").trim();
+    const isAdm=btoa(input)===CFG._a||input.toUpperCase()==="ADMIN"||
+                input.toLowerCase()===atob(CFG._a).toLowerCase();
+    if(isAdm){
+      if(btoa(pass)===CFG._b)
+        return{ok:true,role:"admin",plan:"elite",email:atob(CFG._a),cqid:"ADMIN"};
+      return{ok:false,err:"Incorrect admin password."};
+    }
     try{
       const u=JSON.parse(localStorage.getItem("cx_users")||"[]").find(x=>(x.cqid===input||x.email===input.toLowerCase())&&x.pass===btoa(pass));
       if(!u)return{ok:false,err:"Invalid CQ-ID or password."};
@@ -814,23 +881,63 @@ function LockBar({sig}){
 }
 
 // ── TELEGRAM SEND BUTTON ─────────────────────────────────────────
+// Telegram format
+function fmtTg(coinId, sig) {
+  if(!sig||sig.noSignal) return `📊 <b>${coinId}/USDT</b>\n⏳ No signal — ${sig?.reason?.slice(0,80)||"stand aside"}.`;
+  const isL=sig.signal==="LONG";
+  const rr=sig.rrCheck||{rr1:"1.5",rr2:"2.5",rr3:"4.5"};
+  const tfStr=sig.tfDetail?.map(t=>`${t.tf.toUpperCase()}:${t.trend}`).join(" | ")||sig.tf||"";
+  return `🤖 <b>CRYPTEX QUANT v6</b>
+━━━━━━━━━━━━━━━━━━━━
+${isL?"🟢":"🔴"} <b>${coinId}/USDT — ${sig.signal}</b>
+${sig.strategy?.toUpperCase()} | <b>${sig.conf}%</b> conf | ✦${sig.confirmCount||0} TFs agree
+━━━━━━━━━━━━━━━━━━━━
+📍 <b>Entry:</b> $${fp(sig.eLow)} – $${fp(sig.eHigh)}
+🛑 <b>SL:</b> $${fp(sig.sl)} (${Math.abs(pc(sig.mid,sig.sl))}%)
+🎯 <b>TP1:</b> $${fp(sig.tp1)} R:R 1:${rr.rr1}
+🎯 <b>TP2:</b> $${fp(sig.tp2)} R:R 1:${rr.rr2} ✅
+🎯 <b>TP3:</b> $${fp(sig.tp3)} R:R 1:${rr.rr3}
+📌 Move SL to $${fp(sig.breakEven||sig.brk||sig.mid)} after TP1
+━━━━━━━━━━━━━━━━━━━━
+⏱ ${sig.dur||"—"} | ${sig.lev}× lev | ${sig.risk} risk
+📊 TF: ${tfStr}
+1D Macro: ${sig.macroTrend||"—"} | Win Rate: ~${sig.winRate||"—"}%
+━━━━━━━━━━━━━━━━━━━━
+📐 ${sig.reasons?.[0]||""}
+<i>Not financial advice. Always use stop loss.</i>`;
+}
+
+async function tgSend(token,chatId,text){
+  try{
+    const r=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({chat_id:chatId,text,parse_mode:"HTML"}),signal:AbortSignal.timeout(8000)});
+    const d=await r.json();return d.ok?{ok:true}:{ok:false,err:d.description};
+  }catch(e){return{ok:false,err:e.message};}
+}
+
+// Admin-only: broadcast to ALL active paid subscribers
 function TelegramSendButton({sig, coinId}){
   const[status,setStatus]=useState("");const[loading,setLoading]=useState(false);
-  const hasTg=()=>!!(localStorage.getItem("cq_tg_token")&&localStorage.getItem("cq_tg_chatid"));
-  if(!hasTg()) return null;
+  const adminToken=localStorage.getItem("cq_admin_tg_token")||"";
+  if(!adminToken||!sig||sig.noSignal) return null;
   const send=async()=>{
-    setLoading(true);setStatus("");
-    const token=localStorage.getItem("cq_tg_token");const chatId=localStorage.getItem("cq_tg_chatid");
-    const msg=formatSignalForTelegram(coinId,sig);
-    const r=await sendTelegramMessage(token,chatId,msg);
-    setStatus(r.ok?"✅ Sent to Telegram!":"❌ "+r.err);
-    setLoading(false);setTimeout(()=>setStatus(""),4000);
+    setLoading(true);setStatus("Broadcasting...");
+    const users=Auth.all().filter(u=>u.telegramChatId&&u.plan!=="free"&&Date.now()<u.expiresAt);
+    if(!users.length){setStatus("⚠️ No paid users with Telegram linked yet.");setLoading(false);return;}
+    const msg=fmtTg(coinId,sig);
+    let sent=0;
+    for(const u of users){
+      await new Promise(r=>setTimeout(r,350));
+      const r=await tgSend(adminToken,u.telegramChatId,msg);
+      if(r.ok) sent++;
+    }
+    setStatus(`✅ Broadcast to ${sent}/${users.length} paid subscriber${users.length!==1?"s":""}`);
+    setLoading(false);setTimeout(()=>setStatus(""),6000);
   };
   return(<div style={{marginBottom:10}}>
-    <button className="btn" style={{width:"100%",padding:12,fontSize:12,letterSpacing:1,background:"linear-gradient(135deg,#0077a8,#00a8cc)",color:"#fff",boxShadow:"0 4px 16px rgba(0,136,204,.3)"}} onClick={send} disabled={loading||!sig||sig.noSignal}>
-      {loading?<Spin sz={14}/>:<><span style={{fontSize:16}}>✈️</span> SEND TO TELEGRAM</>}
+    <button style={{width:"100%",padding:12,fontSize:12,letterSpacing:1,background:"linear-gradient(135deg,#006699,#0099cc)",color:"#fff",boxShadow:"0 4px 16px rgba(0,153,204,.3)",border:"none",borderRadius:10,cursor:"pointer",display:"flex",alignItems:"center",gap:7,justifyContent:"center",fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,textTransform:"uppercase"}} onClick={send} disabled={loading}>
+      {loading?<Spin sz={14}/>:<><span style={{fontSize:16}}>✈️</span> BROADCAST TO PAID SUBSCRIBERS</>}
     </button>
-    {status&&<div style={{marginTop:6,fontSize:12,color:status.startsWith("✅")?"var(--g)":"var(--r)",textAlign:"center"}}>{status}</div>}
+    {status&&<div style={{marginTop:5,fontSize:12,color:status.startsWith("✅")?"var(--g)":"var(--y)",textAlign:"center",padding:"6px",background:status.startsWith("✅")?"rgba(0,230,118,.07)":"rgba(255,204,0,.07)",borderRadius:8}}>{status}</div>}
   </div>);
 }
 
@@ -1245,6 +1352,33 @@ function TelegramScanSendButton({results}){
 }
 
 // ── SCANNER ───────────────────────────────────────────────────────
+
+function TelegramScanBtn({results}){
+  const [status,setStatus]=useState("");const [loading,setLoading]=useState(false);
+  const token=localStorage.getItem("cq_admin_tg_token")||"";
+  if(!token||!results?.length) return null;
+  const send=async()=>{
+    setLoading(true);setStatus("Sending...");
+    const users=Auth.all().filter(u=>u.telegramChatId&&u.plan!=="free"&&Date.now()<u.expiresAt);
+    if(!users.length){setStatus("⚠️ No paid users linked");setLoading(false);return;}
+    const longs=results.filter(r=>r.signal==="LONG").length;
+    const shorts=results.filter(r=>r.signal==="SHORT").length;
+    const sum=`📊 <b>CRYPTEX QUANT — SCAN</b>\n━━━━━━━━━━━━━━━━━━━━\n🟢 LONG: ${longs} | 🔴 SHORT: ${shorts}\n${results.length} signals (top 5 below)`;
+    for(const u of users) await tgSend(token,u.telegramChatId,sum);
+    for(const r of results.slice(0,5)){
+      await new Promise(res=>setTimeout(res,400));
+      for(const u of users) await tgSend(token,u.telegramChatId,fmtTg(r.coinId,r));
+    }
+    setStatus(`✅ Broadcast to ${users.length} subscriber${users.length!==1?"s":""}`);
+    setLoading(false);setTimeout(()=>setStatus(""),5000);
+  };
+  return(<div style={{display:"flex",flexDirection:"column",gap:4}}>
+    <button style={{padding:"8px 14px",fontSize:11,background:"linear-gradient(135deg,#006699,#0099cc)",color:"#fff",border:"none",borderRadius:10,cursor:"pointer",display:"flex",alignItems:"center",gap:6,fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,textTransform:"uppercase",letterSpacing:1}} onClick={send} disabled={loading}>
+      {loading?<Spin sz={12}/>:<><span>✈️</span> Broadcast Scan</>}
+    </button>
+    {status&&<div style={{fontSize:10,color:"var(--g)",textAlign:"center"}}>{status}</div>}
+  </div>);
+}
 function PageScan(){
   const[phase,setPhase]=useState("idle");const[prog,setProg]=useState({msg:"",pct:0,found:0});
   const[results,setResults]=useState([]);const[st,setSt]=useState("day");
@@ -1820,7 +1954,7 @@ function PageAdmin({user}){
       <span style={{fontSize:18}}>🔔</span><span style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,color:"var(--r)",letterSpacing:.5}}>{pending.length} PAYMENT{pending.length>1?"S":""} AWAITING VERIFICATION</span>
     </div>}
     <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
-      {[["pending","⚠️ Pending"],["users","👥 Users"],["payments","💳 Payments"],["chat","💬 Chat"]].map(([k,l])=>(
+      {[["pending","⚠️ Pending"],["users","👥 Users"],["payments","💳 Payments"],["telegram","✈️ Telegram"],["chat","💬 Chat"]].map(([k,l])=>(
         <button key={k} className={`btn ${sub===k?"btn-c":"btn-h"}`} style={{padding:"8px 14px"}} onClick={()=>setSub(k)}>
           {l}{k==="pending"&&pending.length>0?` (${pending.length})`:k==="users"?` (${users.length})`:""}
         </button>
@@ -1869,6 +2003,42 @@ function PageAdmin({user}){
           <div className="mono" style={{fontSize:20,fontWeight:700,color:"#ffcc00"}}>{p.usdt} USDT</div>
         </div>
       </div>)}
+    </div>}
+    {sub==="telegram"&&<div style={{display:"flex",flexDirection:"column",gap:14}}>
+      <div className="card" style={{padding:20,border:"1px solid rgba(0,153,204,.25)"}}>
+        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:16}}>
+          <span style={{fontSize:26}}>✈️</span>
+          <div><div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:16,fontWeight:700,marginBottom:2}}>ADMIN BOT TOKEN</div>
+          <div style={{fontSize:12,color:"var(--t2)"}}>{users.filter(u=>u.telegramChatId&&u.plan!=="free"&&Date.now()<u.expiresAt).length} paid subscribers with Telegram linked</div></div>
+        </div>
+        <div style={{marginBottom:10}}>
+          <div style={{fontSize:11,color:"var(--t2)",marginBottom:5,fontFamily:"'Barlow Condensed',sans-serif",letterSpacing:1}}>BOT TOKEN (from @BotFather)</div>
+          <input className="inp mono" style={{fontSize:12}} placeholder="1234567890:ABCdef..." value={tgToken} onChange={e=>setTgToken(e.target.value)}/>
+        </div>
+        {tgStatus&&<div style={{fontSize:12,padding:"7px 12px",borderRadius:8,marginBottom:8,color:tgStatus.startsWith("✅")?"var(--g)":"var(--r)",background:tgStatus.startsWith("✅")?"rgba(0,230,118,.07)":"rgba(255,32,82,.07)"}}>{tgStatus}</div>}
+        <div style={{display:"flex",gap:8}}>
+          <button className="btn bc" style={{flex:1,padding:10,fontSize:11}} onClick={()=>{localStorage.setItem("cq_admin_tg_token",tgToken.trim());setTgStatus("✅ Saved! Now use 'Broadcast' on any signal.");}} disabled={!tgToken.trim()}>💾 Save Token</button>
+          <button className="btn bo" style={{flex:1,padding:10,fontSize:11}} onClick={async()=>{setTgLoading(true);setTgStatus("Testing...");const r=await tgSend(tgToken.trim(),"@"+tgToken.split(":")[0],"✅ Bot connected!");setTgStatus(r.ok?"✅ Bot working!":"❌ "+r.err);setTgLoading(false);}} disabled={!tgToken.trim()||tgLoading}>{tgLoading?<Spin sz={12}/>:"📤 Test"}</button>
+        </div>
+        <div style={{marginTop:12,padding:"10px 12px",background:"var(--bg3)",borderRadius:8,fontSize:11,color:"var(--t2)",lineHeight:1.8}}>
+          <div style={{color:"var(--c)",fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,marginBottom:4}}>How signals reach users:</div>
+          <div>1. You (admin) save Bot Token here</div>
+          <div>2. Paid users link Chat ID in Settings → Telegram</div>
+          <div>3. You click "Broadcast to Paid Subscribers" on any signal</div>
+          <div>4. System sends to all active paid users with linked Telegram</div>
+          <div>5. Scanner → "Broadcast Scan" sends top 5 results</div>
+        </div>
+      </div>
+      <div className="card" style={{padding:16}}>
+        <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:11,color:"var(--t2)",letterSpacing:2,marginBottom:12}}>LINKED SUBSCRIBERS</div>
+        {users.filter(u=>u.telegramChatId&&u.plan!=="free"&&Date.now()<u.expiresAt).length===0?
+          <div style={{fontSize:13,color:"var(--t2)"}}>No paid users have linked Telegram yet. Ask subscribers to go to Settings → Link Telegram.</div>:
+          users.filter(u=>u.telegramChatId&&u.plan!=="free"&&Date.now()<u.expiresAt).map((u,i)=>(
+          <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"8px 0",borderBottom:"1px solid var(--bdr)",fontSize:12}}>
+            <div><span className="mono" style={{color:"var(--c)"}}>{u.cqid||u.email}</span><span className="pill pc" style={{fontSize:9,marginLeft:8}}>{u.plan}</span></div>
+            <span className="mono" style={{color:"var(--t2)",fontSize:11}}>{u.telegramChatId}</span>
+          </div>))}
+      </div>
     </div>}
     {sub==="chat"&&<PageChat user={user}/>}
   </div>);
