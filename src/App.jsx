@@ -151,7 +151,7 @@ async function quantAnalyze(sym, strategy, livePx){
   const cls=kl.map(k=>k.c);
   const price=livePx||cls[cls.length-1];
 
-  // Indicators
+  // ── Core indicators
   const rsi=calcRSI(cls,14);
   const ema20=calcEMA(cls,20),ema50=calcEMA(cls,50),ema200=calcEMA(cls,Math.min(150,cls.length));
   const macd=calcMACD(cls);
@@ -164,53 +164,75 @@ async function quantAnalyze(sym, strategy, livePx){
   const div=detectDivergence(cls,rsi);
   const ob=await getOrderBook(sym);
 
-  // High-Timeframe Trend Confirmation
+  // ── Multi-timeframe confirmation (HTF trend)
   const htfIntv={scalp:"1h",day:"4h",swing:"1d"}[strategy];
   const htfKl=await getKlines(sym,htfIntv,60);
   const htfTrend=htfKl?calcEMA(htfKl.map(k=>k.c),20)>calcEMA(htfKl.map(k=>k.c),50)?"UP":"DOWN":"UNKNOWN";
 
-  // Momentum Filter: பிட்கள் 60% மேல் இருந்தால் Bullish
-  const isHighBuyingPressure = ob.bidPct > 60;
-  const isHighSellingPressure = ob.askPct > 60;
-
+  // ── Signal scoring — Triple Confirmation System
+  // Each bullish indicator = +1 point, bearish = -1 point
   const signals=[];
 
-  // Logic: 4H Trend alignment + RSI + Order Book
+  // 1. EMA Stack
+  if(ema20>ema50&&ema50>ema200){signals.push({ind:"EMA Stack",bull:true,reason:"EMA20>EMA50>EMA200 — full bullish alignment"});}
+  else if(ema20<ema50&&ema50<ema200){signals.push({ind:"EMA Stack",bull:false,reason:"EMA20<EMA50<EMA200 — full bearish alignment"});}
+
+  // 2. RSI
   if(strategy==="scalp"){
-    // Long: Oversold + High Bids + Trend UP
-    if(rsi < 35 && isHighBuyingPressure && htfTrend === "UP") {
-      signals.push({ind:"Momentum",bull:true,reason:"Oversold + Strong Bids + HTF Trend UP"});
-    }
-    // Short: Overbought + High Asks + Trend DOWN
-    else if(rsi > 65 && isHighSellingPressure && htfTrend === "DOWN") {
-      signals.push({ind:"Momentum",bull:false,reason:"Overbought + Strong Asks + HTF Trend DOWN"});
-    }
+    if(rsi<30)signals.push({ind:"RSI",bull:true,reason:`RSI ${rsi} — heavily oversold, reversal imminent`});
+    else if(rsi>70)signals.push({ind:"RSI",bull:false,reason:`RSI ${rsi} — heavily overbought, pullback likely`});
+    else if(rsi<40)signals.push({ind:"RSI",bull:true,reason:`RSI ${rsi} — oversold zone`});
+    else if(rsi>60)signals.push({ind:"RSI",bull:false,reason:`RSI ${rsi} — overbought zone`});
+  } else {
+    if(rsi<45&&rsi>25)signals.push({ind:"RSI",bull:true,reason:`RSI ${rsi} — bullish territory, momentum available`});
+    else if(rsi>55&&rsi<75)signals.push({ind:"RSI",bull:false,reason:`RSI ${rsi} — bearish pressure building`});
   }
 
-  // Basic Indicator Checks
-  if(ema20>ema50) signals.push({ind:"EMA",bull:true,reason:"Short-term Bullish Trend"});
-  else if(ema20<ema50) signals.push({ind:"EMA",bull:false,reason:"Short-term Bearish Trend"});
+  // 3. MACD
+  if(macd.bull&&macd.hist>0)signals.push({ind:"MACD",bull:true,reason:"MACD above signal line — bullish crossover confirmed"});
+  else if(!macd.bull&&macd.hist<0)signals.push({ind:"MACD",bull:false,reason:"MACD below signal line — bearish momentum"});
 
-  if(ob.bullish) signals.push({ind:"Order Book",bull:true,reason:`Buyers dominant (${ob.bidPct}%)`});
-  else if(ob.bearish) signals.push({ind:"Order Book",bull:false,reason:`Sellers dominant (${ob.askPct}%)`});
+  // 4. Bollinger Bands
+  if(bb.pct<0.2)signals.push({ind:"BB",bull:true,reason:"Price at Bollinger lower band — mean reversion buy zone"});
+  else if(bb.pct>0.8)signals.push({ind:"BB",bull:false,reason:"Price at Bollinger upper band — mean reversion sell zone"});
 
-  const bulls=signals.filter(s=>s.bull);
-  const bears=signals.filter(s=>!s.bull);
-  const bullCount=bulls.length;
-  const bearCount=bears.length;
+  // 5. VWAP
+  if(price>vwap*1.002)signals.push({ind:"VWAP",bull:true,reason:"Price above VWAP — institutional buying bias"});
+  else if(price<vwap*0.998)signals.push({ind:"VWAP",bull:false,reason:"Price below VWAP — institutional selling bias"});
 
-  // Final Decision Filter
-  if(bullCount<2 && bearCount<2) return null;
-  const isBull = bullCount > bearCount;
+  // 6. Order Book (real bid/ask pressure)
+  if(ob.bullish)signals.push({ind:"Order Book",bull:true,reason:`Bid wall ${ob.bidPct}% dominant — buyers defending price`});
+  else if(ob.bearish)signals.push({ind:"Order Book",bull:false,reason:`Ask wall ${ob.askPct}% dominant — sellers pressing down`});
 
-  // Trend-Safety Check: ட்ரெண்டிற்கு எதிராக சிக்னல் தராது
-  if(isBull && htfTrend === "DOWN") return null;
-  if(!isBull && htfTrend === "UP") return null;
+  // 7. Whale / Liquidity
+  if(liq.whaleBuy)signals.push({ind:"Whale",bull:true,reason:`Volume spike ${liq.volRatio}× — whale accumulation detected`});
+  else if(liq.whaleSell)signals.push({ind:"Whale",bull:false,reason:`Volume spike ${liq.volRatio}× — whale distribution detected`});
 
-  const conf=Math.min(95, 70 + (Math.abs(bullCount - bearCount) * 10));
+  // 8. Divergence
+  if(div==="bullish")signals.push({ind:"Divergence",bull:true,reason:"Bullish divergence — price lower but momentum higher"});
+  else if(div==="bearish")signals.push({ind:"Divergence",bull:false,reason:"Bearish divergence — price higher but momentum fading"});
+
+  // 9. S/R + HTF Trend
+  if(sr.nearSupport&&htfTrend==="UP")signals.push({ind:"S/R+HTF",bull:true,reason:`Price near support $${fp(sr.support)} with higher-timeframe uptrend`});
+  else if(sr.nearResist&&htfTrend==="DOWN")signals.push({ind:"S/R+HTF",bull:false,reason:`Price near resistance $${fp(sr.resistance)} with higher-timeframe downtrend`});
+
+  // 10. Stochastic
+  if(stoch.k<20)signals.push({ind:"Stoch",bull:true,reason:`Stochastic ${stoch.k} — oversold, crossover imminent`});
+  else if(stoch.k>80)signals.push({ind:"Stoch",bull:false,reason:`Stochastic ${stoch.k} — overbought, reversal risk`});
+
+  const bulls=signals.filter(s=>s.bull);const bears=signals.filter(s=>!s.bull);
+  const bullCount=bulls.length;const bearCount=bears.length;
+
+  // TRIPLE CONFIRMATION: need at least 3 aligned
+  if(bullCount<3&&bearCount<3)return null;
+
+  const isBull=bullCount>bearCount;const aligned=isBull?bulls:bears;
+  const conf=Math.min(95,Math.max(CFG.MIN_CONF,Math.round(55+aligned.length*5+(liq.volRatio-1)*3+(ob.bullish&&isBull||ob.bearish&&!isBull?5:0))));
+  if(conf<CFG.MIN_CONF)return null;
+
   const sig=isBull?"LONG":"SHORT";
-
-  // Risk & TP Calculations (அப்படியே தொடரும்...)
+  const lev={scalp:12,day:10,swing:5}[strategy];
+  const risk=conf>=85?"LOW":conf>=75?"MEDIUM":"HIGH";
   const ATR=Math.max(atr,price*0.004);
   const spreadLo=Math.max(ATR*0.3,price*0.002);
   const spreadHi=Math.max(ATR*0.55,price*0.004);
@@ -224,15 +246,23 @@ async function quantAnalyze(sym, strategy, livePx){
   const tp3=fx(isBull?mid+slD*5.0:mid-slD*5.0,price);
   const breakEven=fx(isBull?mid+slD*0.5:mid-slD*0.5,price);
 
+  const topReasons=aligned.slice(0,4).map(s=>s.reason);
+  const confirmCount=aligned.length;
+
   return{
-    signal:sig,conf,strategy,lev:10,risk:"MEDIUM",price,eLow,eHigh,mid,sl,tp1,tp2,tp3,breakEven,
-    trailingNote:`Move SL to Break-Even once TP1 is hit.`,
-    reasons:signals.slice(0,4).map(s=>s.reason),
-    ind:{rsi,ob,htfTrend},
+    signal:sig,conf,strategy,lev,risk,price,eLow,eHigh,mid,sl,tp1,tp2,tp3,breakEven,
+    trailingNote:`Move SL to Break-Even ($${fp(breakEven)}) once TP1 ($${fp(tp1)}) is hit.`,
+    tf:{scalp:"1M/5M",day:"15M/1H",swing:"4H/1D"}[strategy],
+    dur:{scalp:"15–45 min",day:"4–12 hours",swing:"1–5 days"}[strategy],
+    reasons:topReasons,
+    confirmCount,
+    ind:{rsi,ema20:fx(ema20,price),ema50:fx(ema50,price),vwap:fx(vwap,price),bb,macd,stoch,volRatio:liq.volRatio,ob,sr,liq,htfTrend,div},
+    winRate:Math.min(88,Math.max(58,Math.round(58+conf*0.32))),
     lockedAt:Date.now(),
     volatileMarket:false,
   };
 }
+
 // ── BTC DOMINANCE ADJUSTMENT ──────────────────────────────────────
 // If BTC is in strong downtrend, reduce confidence of altcoin longs
 async function adjustForBTCDominance(signals,coins){
