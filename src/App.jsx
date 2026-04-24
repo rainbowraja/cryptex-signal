@@ -88,14 +88,7 @@ function calcStoch(kl,p=14){
   const K=hi>lo?(kl[kl.length-1].c-lo)/(hi-lo)*100:50;
   return{k:parseFloat(K.toFixed(1)),d:50};
 }
-function detectDivergence(c,r){
-  if(!c||c.length<10||!r)return"none";
-  const pc5=c[c.length-5];const pc1=c[c.length-1];
-  const rsiApprox=r;
-  if(pc1<pc5&&rsiApprox>50)return"bullish";
-  if(pc1>pc5&&rsiApprox<50)return"bearish";
-  return"none";
-}
+// detectDivergence → moved to prediction engine (line ~1945)
 function detectSR(kl){
   if(!kl||kl.length<20)return{support:0,resistance:0,nearSupport:false,nearResist:false};
   const closes=kl.map(k=>k.c);const price=closes[closes.length-1];
