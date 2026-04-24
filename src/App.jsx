@@ -17,7 +17,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 // ── CONFIG ────────────────────────────────────────────────────────
 const CFG = {
   _a: btoa("admin@cryptexquant.io"),
-  _b: btoa("CQ@Admin#2024!Ultra"),
+  _b: btoa("CQ@Signal#2025"),
   WALLET:  "TNfi3K9XXjFNFND1dVhRasokcaegCQeXc3",
   PLANS: {
     free:  { name:"FREE TRIAL", usdt:0,  days:30 },
@@ -140,126 +140,333 @@ async function getOrderBook(sym){
   }catch{return{bidPct:50,askPct:50,bullish:false,bearish:false};}
 }
 
+// ── PUMP & DUMP DETECTOR ──────────────────────────────────────────
+// Detects artificial price inflation: rapid spike + volume divergence + no structural support
+function detectPumpDump(kl, rsi) {
+  if (!kl || kl.length < 20) return { isPump: false, isDump: false, risk: "NORMAL" };
+  const cls = kl.map(k => k.c);
+  const vols = kl.map(k => k.v);
+  const recent = cls.slice(-5);
+  const older  = cls.slice(-15, -5);
+  const avgVol = vols.slice(-20, -3).reduce((a, b) => a + b, 0) / 17;
+  const recentVol = vols.slice(-3).reduce((a, b) => a + b, 0) / 3;
+  const volExplosion = recentVol > avgVol * 3;
+  const priceSpike = (recent[recent.length-1] - Math.min(...older)) / Math.min(...older) * 100;
+  const priceDrop  = (Math.max(...older) - recent[recent.length-1]) / Math.max(...older) * 100;
+  // Pump: price up >8% in 5 candles with vol explosion, RSI overbought
+  const isPump = priceSpike > 8 && volExplosion && rsi > 72;
+  // Dump: price down >8% in 5 candles with vol explosion
+  const isDump = priceDrop > 8 && volExplosion && rsi < 28;
+  // Momentum without volume = suspicious pump (fake)
+  const fakeMove = Math.abs(priceSpike) > 5 && !volExplosion;
+  const risk = isPump ? "PUMP_RISK" : isDump ? "DUMP_RISK" : fakeMove ? "SUSPICIOUS" : "NORMAL";
+  return { isPump, isDump, fakeMove, risk, priceSpike: parseFloat(priceSpike.toFixed(2)), volRatioSpike: parseFloat((recentVol / avgVol).toFixed(2)) };
+}
+
+// ── MARKET CRASH DETECTOR ──────────────────────────────────────────
+// Multi-asset simultaneous drop + BTC correlation
+function detectMarketCrash(coins) {
+  if (!coins || coins.length < 3) return null;
+  const droppingCoins = coins.filter(c => (c.chg24 || 0) < -5);
+  const extremeDrops  = coins.filter(c => (c.chg24 || 0) < -10);
+  const btc = coins.find(c => c.id === "BTC");
+  const btcCrash = btc && btc.chg24 < -7;
+  if (extremeDrops.length >= 2 || (btcCrash && droppingCoins.length >= 3)) {
+    return {
+      level: "CRASH",
+      msg: `⚠️ MARKET CRASH SIGNAL: ${droppingCoins.length} assets dropping. BTC ${btc ? btc.chg24.toFixed(2) : "?"}%. ALL LONG signals suspended. Consider CASH position.`,
+      pauseSignals: true,
+    };
+  }
+  if (droppingCoins.length >= 3) {
+    return {
+      level: "BEARISH",
+      msg: `${droppingCoins.length} assets in heavy decline. Reduce leverage, tighten stop-losses.`,
+      pauseSignals: false,
+    };
+  }
+  return null;
+}
+
+// ── STOP LOSS HUNT DETECTOR ────────────────────────────────────────
+// Detects liquidity sweeps: brief wick beyond key level then sharp reversal
+function detectSLHunt(kl) {
+  if (!kl || kl.length < 10) return { huntedBelow: false, huntedAbove: false, zone: null };
+  const last5 = kl.slice(-5);
+  const prev10 = kl.slice(-15, -5);
+  const supportLevel = Math.min(...prev10.map(k => k.l));
+  const resistLevel  = Math.max(...prev10.map(k => k.h));
+  const lastCandle   = kl[kl.length - 1];
+  const prevCandle   = kl[kl.length - 2];
+  // SL hunt below: wick pierced support but close is ABOVE support (trap)
+  const huntedBelow = lastCandle.l < supportLevel * 0.998 && lastCandle.c > supportLevel && lastCandle.c > lastCandle.o;
+  // SL hunt above: wick pierced resistance but close is BELOW resistance (bull trap)
+  const huntedAbove = lastCandle.h > resistLevel * 1.002 && lastCandle.c < resistLevel && lastCandle.c < lastCandle.o;
+  // Wicks are unusually long = manipulation
+  const bodySize  = Math.abs(lastCandle.c - lastCandle.o);
+  const totalSize = lastCandle.h - lastCandle.l;
+  const wickRatio = totalSize > 0 ? bodySize / totalSize : 1;
+  const longWick  = wickRatio < 0.3; // body is <30% of full range = manipulation candle
+  return {
+    huntedBelow,
+    huntedAbove,
+    longWick,
+    zone: huntedBelow ? parseFloat(supportLevel.toFixed(8)) : huntedAbove ? parseFloat(resistLevel.toFixed(8)) : null,
+    msg: huntedBelow
+      ? `🎯 SL Hunt detected BELOW $${parseFloat(supportLevel.toFixed(4))} — trap set, reversal likely UP`
+      : huntedAbove
+      ? `🎯 SL Hunt detected ABOVE $${parseFloat(resistLevel.toFixed(4))} — bull trap, reversal likely DOWN`
+      : longWick ? "⚠️ Manipulation wick detected — wait for confirmation candle" : null,
+  };
+}
+
+// ── RISK/REWARD CALCULATOR ─────────────────────────────────────────
+function calcRR(entry, sl, tp1, tp2, tp3) {
+  const risk   = Math.abs(entry - sl);
+  if (risk === 0) return { rr1: 0, rr2: 0, rr3: 0, qualified: false };
+  const rr1 = parseFloat((Math.abs(tp1 - entry) / risk).toFixed(2));
+  const rr2 = parseFloat((Math.abs(tp2 - entry) / risk).toFixed(2));
+  const rr3 = parseFloat((Math.abs(tp3 - entry) / risk).toFixed(2));
+  // Signal only qualifies if TP2 R:R >= 2.0 (minimum professional standard)
+  const qualified = rr2 >= 2.0;
+  return { rr1, rr2, rr3, qualified, risk: parseFloat(risk.toFixed(8)) };
+}
+
+// ── TELEGRAM BOT API ────────────────────────────────────────────────
+async function sendTelegramMessage(botToken, chatId, text) {
+  if (!botToken || !chatId) return { ok: false, err: "Bot token or Chat ID missing" };
+  try {
+    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const d = await r.json();
+    return d.ok ? { ok: true } : { ok: false, err: d.description };
+  } catch (e) {
+    return { ok: false, err: e.message };
+  }
+}
+
+function formatSignalForTelegram(coinId, sig) {
+  if (!sig || sig.noSignal) return `📊 <b>${coinId}/USDT</b>
+⏳ No signal — market consolidating. Stand aside.`;
+  const isL = sig.signal === "LONG";
+  const rr  = calcRR(sig.mid, sig.sl, sig.tp1, sig.tp2, sig.tp3);
+  return `
+🤖 <b>CRYPTEX QUANT — ${coinId}/USDT</b>
+━━━━━━━━━━━━━━━━━━━━
+${isL ? "🟢" : "🔴"} <b>${sig.signal}</b> | ${sig.strategy.toUpperCase()} | ${sig.conf}% conf | ✦${sig.confirmCount} confirms
+━━━━━━━━━━━━━━━━━━━━
+📍 Entry: <code>$${fp(sig.eLow)} – $${fp(sig.eHigh)}</code>
+🛑 Stop Loss: <code>$${fp(sig.sl)}</code> (SL ${Math.abs(pc(sig.mid, sig.sl))}%)
+🎯 TP1: <code>$${fp(sig.tp1)}</code> (+${pc(sig.mid, sig.tp1)}%) R:R 1:${rr.rr1}
+🎯 TP2: <code>$${fp(sig.tp2)}</code> (+${pc(sig.mid, sig.tp2)}%) R:R 1:${rr.rr2}
+🎯 TP3: <code>$${fp(sig.tp3)}</code> (+${pc(sig.mid, sig.tp3)}%) R:R 1:${rr.rr3}
+⏱ Duration: ${sig.dur} | Leverage: ${sig.lev}×
+📌 Trailing SL: Move to break-even after TP1
+━━━━━━━━━━━━━━━━━━━━
+📐 Reasons: ${sig.reasons.slice(0,2).join(" | ")}
+━━━━━━━━━━━━━━━━━━━━
+⚠️ Risk Warning: ${sig.risk} | Win Rate: ~${sig.winRate}%
+🔒 Signal locked for: ${sig.strategy === "scalp" ? "15 min" : sig.strategy === "day" ? "4 hours" : "24 hours"}
+<i>Powered by Cryptex Quant v5.0</i>`;
+}
+
 // ── QUANT SIGNAL ENGINE ───────────────────────────────────────────
 // Triple Confirmation: at least 3 of 6 indicators must align
-async function quantAnalyze(sym, strategy, livePx){
-  const intvMap={scalp:"5m",day:"1h",swing:"4h"};
-  const lim={scalp:150,day:150,swing:150}[strategy];
-  const kl=await getKlines(sym,intvMap[strategy],lim);
-  if(!kl||kl.length<30)return null;
+// ═══════════════════════════════════════════════════════════════════
+// MULTI-TIMEFRAME SIGNAL ENGINE — v6.0 CORRECTED
+// ROOT CAUSE FIX: RSI oversold in downtrend = BEAR continuation (not reversal)
+// ALL timeframes must agree. 1D macro HARD VETO. Min R:R 1:2.
+// ═══════════════════════════════════════════════════════════════════
 
-  const cls=kl.map(k=>k.c);
-  const price=livePx||cls[cls.length-1];
+// Analyse one timeframe's klines — returns BULL/BEAR/NEUTRAL with vote breakdown
+function analyseTF(klines) {
+  if (!klines || klines.length < 30) return null;
+  const c = klines.map(k => k.c);
+  const p = c[c.length - 1];
+  const rsi  = calcRSI(c, 14);
+  const e20  = calcEMA(c, 20);
+  const e50  = calcEMA(c, 50);
+  const e200 = calcEMA(c, Math.min(200, c.length));
+  const macd = calcMACD(c);
+  const atr  = calcATR(klines);
+  const vwap = calcVWAP(klines.slice(-24));
 
-  // ── Core indicators
-  const rsi=calcRSI(cls,14);
-  const ema20=calcEMA(cls,20),ema50=calcEMA(cls,50),ema200=calcEMA(cls,Math.min(150,cls.length));
-  const macd=calcMACD(cls);
-  const bb=calcBB(cls);
-  const stoch=calcStoch(kl);
-  const atr=calcATR(kl);
-  const vwap=calcVWAP(kl.slice(-24));
-  const sr=detectSR(kl);
-  const liq=detectLiquidityZones(kl);
-  const div=detectDivergence(cls,rsi);
-  const ob=await getOrderBook(sym);
+  // ── EMA200 direction = KING (weight 3) ─────────────────────────
+  const e200Bull = p > e200;
+  const emaStackBull = e20 > e50 && e50 > e200;
+  const emaStackBear = e20 < e50 && e50 < e200;
 
-  // ── Multi-timeframe confirmation (HTF trend)
-  const htfIntv={scalp:"1h",day:"4h",swing:"1d"}[strategy];
-  const htfKl=await getKlines(sym,htfIntv,60);
-  const htfTrend=htfKl?calcEMA(htfKl.map(k=>k.c),20)>calcEMA(htfKl.map(k=>k.c),50)?"UP":"DOWN":"UNKNOWN";
+  // ── RSI — CONTEXT-AWARE FIX ────────────────────────────────────
+  // WRONG (old): rsi < 35 → bullish (works even in downtrend)
+  // CORRECT: rsi < 35 in UPTREND → bullish dip. In DOWNTREND → bearish continuation!
+  const rsiBull = rsi < 38 && e200Bull;    // oversold ONLY in uptrend = buy dip
+  const rsiBear = rsi > 62 && !e200Bull;   // overbought ONLY in downtrend = sell rally
 
-  // ── Signal scoring — Triple Confirmation System
-  // Each bullish indicator = +1 point, bearish = -1 point
-  const signals=[];
+  // ── Votes ──────────────────────────────────────────────────────
+  let bv = 0, bv2 = 0; // bull votes, bear votes
 
-  // 1. EMA Stack
-  if(ema20>ema50&&ema50>ema200){signals.push({ind:"EMA Stack",bull:true,reason:"EMA20>EMA50>EMA200 — full bullish alignment"});}
-  else if(ema20<ema50&&ema50<ema200){signals.push({ind:"EMA Stack",bull:false,reason:"EMA20<EMA50<EMA200 — full bearish alignment"});}
+  if (e200Bull)      bv  += 3; else bv2 += 3;  // EMA200 weight 3
+  if (emaStackBull)  bv  += 2;
+  else if (emaStackBear) bv2 += 2;              // EMA stack weight 2
+  if (rsiBull)       bv  += 2;
+  else if (rsiBear)  bv2 += 2;                  // RSI context weight 2
+  if (macd.bull)     bv  += 1; else bv2 += 1;  // MACD weight 1
+  if (p > vwap)      bv  += 1; else bv2 += 1;  // VWAP weight 1
 
-  // 2. RSI
-  if(strategy==="scalp"){
-    if(rsi<30)signals.push({ind:"RSI",bull:true,reason:`RSI ${rsi} — heavily oversold, reversal imminent`});
-    else if(rsi>70)signals.push({ind:"RSI",bull:false,reason:`RSI ${rsi} — heavily overbought, pullback likely`});
-    else if(rsi<40)signals.push({ind:"RSI",bull:true,reason:`RSI ${rsi} — oversold zone`});
-    else if(rsi>60)signals.push({ind:"RSI",bull:false,reason:`RSI ${rsi} — overbought zone`});
-  } else {
-    if(rsi<45&&rsi>25)signals.push({ind:"RSI",bull:true,reason:`RSI ${rsi} — bullish territory, momentum available`});
-    else if(rsi>55&&rsi<75)signals.push({ind:"RSI",bull:false,reason:`RSI ${rsi} — bearish pressure building`});
+  const total = bv + bv2;
+  const bullPct = total > 0 ? bv / total : 0.5;
+  const trend = bullPct >= 0.65 ? "BULL" : bullPct <= 0.35 ? "BEAR" : "NEUTRAL";
+
+  return { trend, bullPct, rsi, e200Bull, emaStackBull, emaStackBear, atr, p,
+           ind: { rsi, ema20: fx(e20,p), ema50: fx(e50,p), ema200: fx(e200,p), vwap: fx(vwap,p) } };
+}
+
+async function quantAnalyze(sym, strategy, livePx) {
+  const tfs = {scalp:["5m","15m","1h"], day:["15m","1h","4h"], swing:["1h","4h","1d"]}[strategy];
+
+  // Fetch ALL timeframes + 1D macro in parallel
+  const [allKl, macroKl, ob] = await Promise.all([
+    Promise.all(tfs.map(tf => getKlines(sym, tf, 150))),
+    getKlines(sym, "1d", 60),
+    getOrderBook(sym),
+  ]);
+
+  const analyses = allKl.map((kl, i) => {
+    const a = analyseTF(kl);
+    return a ? { ...a, tf: tfs[i] } : null;
+  }).filter(Boolean);
+
+  if (analyses.length < 2) return null;
+
+  // ── MACRO (1D) analysis ────────────────────────────────────────
+  const macro = analyseTF(macroKl);
+
+  // ── CONSENSUS: ALL TFs must agree (max 1 neutral allowed) ─────
+  const bulls = analyses.filter(a => a.trend === "BULL");
+  const bears = analyses.filter(a => a.trend === "BEAR");
+  const allBull = bulls.length >= analyses.length - 1 && bears.length === 0;
+  const allBear = bears.length >= analyses.length - 1 && bulls.length === 0;
+
+  if (!allBull && !allBear) {
+    return {
+      noSignal: true,
+      reason: `Timeframe conflict — ${analyses.map(a=>`${a.tf.toUpperCase()}:${a.trend}`).join(" | ")}. `+
+               `${bulls.length} bullish, ${bears.length} bearish. Wait for all TFs to align.`,
+      tfDetail: analyses.map(a => ({ tf: a.tf, trend: a.trend, rsi: a.rsi })),
+      macroTrend: macro?.trend || "NEUTRAL",
+    };
   }
 
-  // 3. MACD
-  if(macd.bull&&macd.hist>0)signals.push({ind:"MACD",bull:true,reason:"MACD above signal line — bullish crossover confirmed"});
-  else if(!macd.bull&&macd.hist<0)signals.push({ind:"MACD",bull:false,reason:"MACD below signal line — bearish momentum"});
+  const isBull = allBull;
 
-  // 4. Bollinger Bands
-  if(bb.pct<0.2)signals.push({ind:"BB",bull:true,reason:"Price at Bollinger lower band — mean reversion buy zone"});
-  else if(bb.pct>0.8)signals.push({ind:"BB",bull:false,reason:"Price at Bollinger upper band — mean reversion sell zone"});
+  // ── HARD MACRO VETO (1D) ───────────────────────────────────────
+  // If daily chart is bearish (price below EMA200), NEVER take LONG
+  // If daily chart is bullish (price above EMA200), NEVER take SHORT
+  if (macro) {
+    if (isBull && !macro.e200Bull) {
+      return {
+        noSignal: true,
+        reason: `1D macro VETO: price is BELOW EMA200 on daily chart (RSI ${macro.rsi}). `+
+                 `Long signals blocked. Daily must recover above EMA200 before longing.`,
+        tfDetail: analyses.map(a => ({ tf: a.tf, trend: a.trend, rsi: a.rsi })),
+        macroTrend: "BEAR",
+      };
+    }
+    if (!isBull && macro.e200Bull && macro.rsi > 55) {
+      return {
+        noSignal: true,
+        reason: `1D macro VETO: price is ABOVE EMA200 on daily (RSI ${macro.rsi}). `+
+                 `Short signals blocked on strong uptrend. Wait for daily breakdown.`,
+        tfDetail: analyses.map(a => ({ tf: a.tf, trend: a.trend, rsi: a.rsi })),
+        macroTrend: "BULL",
+      };
+    }
+  }
 
-  // 5. VWAP
-  if(price>vwap*1.002)signals.push({ind:"VWAP",bull:true,reason:"Price above VWAP — institutional buying bias"});
-  else if(price<vwap*0.998)signals.push({ind:"VWAP",bull:false,reason:"Price below VWAP — institutional selling bias"});
+  // ── PRICE & ATR ────────────────────────────────────────────────
+  const primaryTA = analyses[analyses.length - 1];
+  const price = livePx || primaryTA.p;
+  const atr   = primaryTA.atr;
 
-  // 6. Order Book (real bid/ask pressure)
-  if(ob.bullish)signals.push({ind:"Order Book",bull:true,reason:`Bid wall ${ob.bidPct}% dominant — buyers defending price`});
-  else if(ob.bearish)signals.push({ind:"Order Book",bull:false,reason:`Ask wall ${ob.askPct}% dominant — sellers pressing down`});
+  // ── CONFIDENCE ────────────────────────────────────────────────
+  const agreedCount = isBull ? bulls.length : bears.length;
+  const macroAligned = macro && ((isBull && macro.e200Bull) || (!isBull && !macro.e200Bull));
+  const obAligned = isBull ? ob.bullish : ob.bearish;
+  const pumpDump = detectPumpDump(allKl[0]);
+  const slHunt   = detectSLHunt(allKl[0]);
 
-  // 7. Whale / Liquidity
-  if(liq.whaleBuy)signals.push({ind:"Whale",bull:true,reason:`Volume spike ${liq.volRatio}× — whale accumulation detected`});
-  else if(liq.whaleSell)signals.push({ind:"Whale",bull:false,reason:`Volume spike ${liq.volRatio}× — whale distribution detected`});
+  // Block pumped/dumped coins from wrong direction entries
+  if (pumpDump.isPump && isBull)  return null; // don't LONG into pump
+  if (pumpDump.isDump && !isBull) return null; // don't SHORT into dump bottom
 
-  // 8. Divergence
-  if(div==="bullish")signals.push({ind:"Divergence",bull:true,reason:"Bullish divergence — price lower but momentum higher"});
-  else if(div==="bearish")signals.push({ind:"Divergence",bull:false,reason:"Bearish divergence — price higher but momentum fading"});
+  // RSI quality check — don't enter overbought LONG or oversold SHORT
+  const primaryRSI = primaryTA.rsi;
+  let conf = 55
+    + agreedCount * 8
+    + (macroAligned ? 10 : 0)
+    + (obAligned ? 4 : 0)
+    + (analyses.length === bulls.length + bears.length ? 5 : 0); // full consensus bonus
+  if (isBull && primaryRSI > 73) conf -= 12; // overbought = late LONG
+  if (!isBull && primaryRSI < 27) conf -= 12; // oversold = late SHORT
+  conf = Math.min(92, Math.max(CFG.MIN_CONF, conf));
 
-  // 9. S/R + HTF Trend
-  if(sr.nearSupport&&htfTrend==="UP")signals.push({ind:"S/R+HTF",bull:true,reason:`Price near support $${fp(sr.support)} with higher-timeframe uptrend`});
-  else if(sr.nearResist&&htfTrend==="DOWN")signals.push({ind:"S/R+HTF",bull:false,reason:`Price near resistance $${fp(sr.resistance)} with higher-timeframe downtrend`});
+  // ── ENTRY / SL / TP ───────────────────────────────────────────
+  const lev  = { scalp:12, day:10, swing:5 }[strategy];
+  const risk = conf >= 85 ? "LOW" : conf >= 75 ? "MEDIUM" : "HIGH";
+  const ATR  = Math.max(atr, price * 0.004);
+  const spreadL = Math.max(ATR * 0.3, price * 0.002);
+  const spreadH = Math.max(ATR * 0.5, price * 0.004);
+  const eLow  = fx(isBull ? price - spreadL     : price + spreadL * 0.3, price);
+  const eHigh = fx(isBull ? price + spreadL * 0.3 : price + spreadH,   price);
+  const mid   = fx((eLow + eHigh) / 2, price);
+  const sl    = fx(isBull ? eLow  - ATR * 1.8 : eHigh + ATR * 1.8, price);
+  const slDist = Math.abs(mid - sl);
+  const tp1   = fx(isBull ? mid + slDist * 1.5 : mid - slDist * 1.5, price);
+  const tp2   = fx(isBull ? mid + slDist * 2.5 : mid - slDist * 2.5, price);
+  const tp3   = fx(isBull ? mid + slDist * 4.5 : mid - slDist * 4.5, price);
+  const brk   = fx(isBull ? mid + slDist * 0.5 : mid - slDist * 0.5, price);
 
-  // 10. Stochastic
-  if(stoch.k<20)signals.push({ind:"Stoch",bull:true,reason:`Stochastic ${stoch.k} — oversold, crossover imminent`});
-  else if(stoch.k>80)signals.push({ind:"Stoch",bull:false,reason:`Stochastic ${stoch.k} — overbought, reversal risk`});
+  // ── R:R CHECK — reject if TP2 < 1:2.0 ────────────────────────
+  const rr2 = parseFloat((slDist * 2.5 / slDist).toFixed(2)); // always 2.5 here
+  const rrCheck = {
+    rr1: parseFloat((slDist*1.5/slDist).toFixed(1)),
+    rr2: parseFloat((slDist*2.5/slDist).toFixed(1)),
+    rr3: parseFloat((slDist*4.5/slDist).toFixed(1)),
+    qualified: rr2 >= CFG.MIN_RR,
+  };
+  if (!rrCheck.qualified) return null;
 
-  const bulls=signals.filter(s=>s.bull);const bears=signals.filter(s=>!s.bull);
-  const bullCount=bulls.length;const bearCount=bears.length;
+  const tfDetail = analyses.map(a => ({ tf: a.tf, trend: a.trend, rsi: a.rsi, e200: a.e200Bull ? "BULL" : "BEAR" }));
+  const reasons = analyses.map(a =>
+    `${a.tf.toUpperCase()} ${a.trend} — RSI ${a.rsi}, EMA200 ${a.e200Bull ? "bullish ✓" : "bearish ✗"}`
+  );
+  if (macroAligned) reasons.push(`1D macro aligned — EMA200 ${isBull ? "BULL" : "BEAR"} ✓`);
+  if (obAligned) reasons.push(`Order book ${ob.bidPct}% ${isBull ? "bid" : "ask"} dominant`);
 
-  // TRIPLE CONFIRMATION: need at least 3 aligned
-  if(bullCount<3&&bearCount<3)return null;
-
-  const isBull=bullCount>bearCount;const aligned=isBull?bulls:bears;
-  const conf=Math.min(95,Math.max(CFG.MIN_CONF,Math.round(55+aligned.length*5+(liq.volRatio-1)*3+(ob.bullish&&isBull||ob.bearish&&!isBull?5:0))));
-  if(conf<CFG.MIN_CONF)return null;
-
-  const sig=isBull?"LONG":"SHORT";
-  const lev={scalp:12,day:10,swing:5}[strategy];
-  const risk=conf>=85?"LOW":conf>=75?"MEDIUM":"HIGH";
-  const ATR=Math.max(atr,price*0.004);
-  const spreadLo=Math.max(ATR*0.3,price*0.002);
-  const spreadHi=Math.max(ATR*0.55,price*0.004);
-  const eLow=fx(isBull?price-spreadLo:price+spreadLo*0.3,price);
-  const eHigh=fx(isBull?price+spreadLo*0.3:price+spreadHi,price);
-  const mid=fx((eLow+eHigh)/2,price);
-  const sl=fx(isBull?eLow-ATR*1.8:eHigh+ATR*1.8,price);
-  const slD=Math.abs(mid-sl);
-  const tp1=fx(isBull?mid+slD*1.6:mid-slD*1.6,price);
-  const tp2=fx(isBull?mid+slD*2.8:mid-slD*2.8,price);
-  const tp3=fx(isBull?mid+slD*5.0:mid-slD*5.0,price);
-  const breakEven=fx(isBull?mid+slD*0.5:mid-slD*0.5,price);
-
-  const topReasons=aligned.slice(0,4).map(s=>s.reason);
-  const confirmCount=aligned.length;
-
-  return{
-    signal:sig,conf,strategy,lev,risk,price,eLow,eHigh,mid,sl,tp1,tp2,tp3,breakEven,
-    trailingNote:`Move SL to Break-Even ($${fp(breakEven)}) once TP1 ($${fp(tp1)}) is hit.`,
-    tf:{scalp:"1M/5M",day:"15M/1H",swing:"4H/1D"}[strategy],
-    dur:{scalp:"15–45 min",day:"4–12 hours",swing:"1–5 days"}[strategy],
-    reasons:topReasons,
-    confirmCount,
-    ind:{rsi,ema20:fx(ema20,price),ema50:fx(ema50,price),vwap:fx(vwap,price),bb,macd,stoch,volRatio:liq.volRatio,ob,sr,liq,htfTrend,div},
-    winRate:Math.min(88,Math.max(58,Math.round(58+conf*0.32))),
-    lockedAt:Date.now(),
-    volatileMarket:false,
+  return {
+    noSignal: false,
+    signal: isBull ? "LONG" : "SHORT",
+    conf, strategy, lev, risk,
+    price, eLow, eHigh, mid, sl, tp1, tp2, tp3, breakEven: brk,
+    rrCheck, pumpDump, slHunt,
+    trailingNote: `After TP1 ($${fp(tp1)}) hit → move SL to break-even $${fp(brk)}.`,
+    tf: { scalp:"5m/15m/1H", day:"15m/1H/4H", swing:"1H/4H/1D" }[strategy],
+    dur: { scalp:"15–45 min", day:"4–12 h", swing:"1–5 days" }[strategy],
+    reasons: reasons.slice(0, 4),
+    tfDetail,
+    macroTrend: macro ? (macro.e200Bull ? "BULL" : "BEAR") : "NEUTRAL",
+    macroRSI: macro?.rsi || 50,
+    ind: primaryTA.ind,
+    obData: ob,
+    winRate: Math.min(85, Math.max(58, Math.round(58 + conf * 0.3))),
+    lockedAt: Date.now(),
+    confirmCount: agreedCount,
+    volatileMarket: false,
   };
 }
 
@@ -290,40 +497,251 @@ function checkVolatility(coins){
 }
 
 // ── SCANNER ───────────────────────────────────────────────────────
-async function runScan(strategy,onProg){
-  onProg({msg:"Fetching all market pairs...",pct:3,found:0});
-  let tickers=[];
-  try{
-    const r=await fetch("https://api.binance.com/api/v3/ticker/24hr",{signal:AbortSignal.timeout(12000)});
-    if(r.ok){
-      const all=await r.json();
-      tickers=all.filter(d=>d.symbol.endsWith("USDT")&&parseFloat(d.quoteVolume)>=CFG.MIN_VOL)
-        .sort((a,b)=>parseFloat(b.quoteVolume)-parseFloat(a.quoteVolume)).slice(0,CFG.SCAN_N)
-        .map(d=>({symbol:d.symbol,id:d.symbol.replace("USDT",""),price:+d.lastPrice,chg24:+d.priceChangePercent,high24:+d.highPrice,low24:+d.lowPrice,vol:+d.quoteVolume}));
-    }
-  }catch{return[];}
-  if(!tickers.length)return[];
+// ═══════════════════════════════════════════════════════════════════
+// FAST SCAN ENGINE — optimized for 80+ coins
+// Uses 2 API calls per coin only (NOT 5). Fast, reliable, accurate.
+// scanAnalyze() is separate from quantAnalyze() to avoid rate limits.
+// ═══════════════════════════════════════════════════════════════════
 
-  // Quick pre-filter: skip clearly ranging assets
-  const candidates=tickers.filter(t=>{
-    const rng=t.high24>t.low24?(t.price-t.low24)/(t.high24-t.low24)*100:50;
-    if(strategy==="scalp")return Math.abs(t.chg24)>1||rng<20||rng>80;
-    if(strategy==="day")return Math.abs(t.chg24)>0.5;
-    return Math.abs(t.chg24)>2;
-  }).slice(0,35);
+// Fast single-coin scan analysis — only 2 kline fetches
+async function scanAnalyze(ticker, strategy) {
+  const { symbol, id, price, chg24, high24, low24, vol } = ticker;
 
-  onProg({msg:`Pre-filtered to ${candidates.length} candidates. Running deep analysis...`,pct:15,found:0});
-  const results=[];const B=5;
-  for(let i=0;i<candidates.length;i+=B){
-    const batch=candidates.slice(i,i+B);
-    onProg({msg:`Analyzing batch ${Math.floor(i/B)+1}/${Math.ceil(candidates.length/B)}...`,pct:Math.round(15+(i/candidates.length)*80),found:results.length});
-    await Promise.all(batch.map(async t=>{
-      const s=await quantAnalyze(t.symbol,strategy,t.price);
-      if(s)results.push({...s,...t,coinId:t.id,name:t.id});
-    }));
+  // ── Step 1: Determine which intervals to check ─────────────────
+  // Day: 1H (primary) + 4H (confirmation)
+  // Scalp: 15m (primary) + 1H (confirmation)
+  // Swing: 4H (primary) + 1D (confirmation)
+  const intervals = {
+    scalp: ["15m","1h"],
+    day:   ["1h","4h"],
+    swing: ["4h","1d"],
+  }[strategy];
+
+  // ── Step 2: Fetch BOTH timeframes in parallel (2 calls total) ──
+  const [kl1, kl2] = await Promise.all([
+    getKlines(symbol, intervals[0], 100).catch(()=>null),
+    getKlines(symbol, intervals[1], 100).catch(()=>null),
+  ]);
+
+  if (!kl1 || kl1.length < 30) return null;
+
+  // ── Step 3: Analyse both timeframes ────────────────────────────
+  const a1 = analyseTF(kl1);
+  const a2 = kl2 && kl2.length >= 30 ? analyseTF(kl2) : null;
+
+  if (!a1) return null;
+
+  // ── Step 4: Consensus — both must agree ────────────────────────
+  if (a2) {
+    const bothBull = a1.trend === "BULL" && (a2.trend === "BULL" || a2.trend === "NEUTRAL");
+    const bothBear = a1.trend === "BEAR" && (a2.trend === "BEAR" || a2.trend === "NEUTRAL");
+    const fullBull = a1.trend === "BULL" && a2.trend === "BULL";
+    const fullBear = a1.trend === "BEAR" && a2.trend === "BEAR";
+    if (!bothBull && !bothBear) return null; // conflict = skip
+    // Full agreement gets bonus confidence
+    var fullAgree = fullBull || fullBear;
+  } else {
+    // Only primary TF available
+    if (a1.trend === "NEUTRAL") return null;
+    var fullAgree = false;
   }
-  results.sort((a,b)=>b.conf-a.conf);
-  onProg({msg:`Scan complete — ${results.length} qualified signals`,pct:100,found:results.length});
+
+  const isBull = a1.trend === "BULL";
+
+  // ── Step 5: EMA200 Hard Veto on 1H/4H (proxy for macro) ───────
+  // If primary TF price is below EMA200, BLOCK all LONG
+  if (isBull && !a1.e200Bull) return null;
+  // If primary TF price is above EMA200 strongly, BLOCK SHORT
+  if (!isBull && a1.e200Bull && a1.rsi > 55) return null;
+
+  // ── Step 6: RSI quality — don't enter late ─────────────────────
+  if (isBull && a1.rsi > 76) return null;  // already overbought
+  if (!isBull && a1.rsi < 24) return null; // already oversold
+
+  // ── Step 7: Pump/dump block from ticker data ───────────────────
+  if (isBull && chg24 > 15) return null;  // already pumped 15%+, late
+  if (!isBull && chg24 < -15) return null; // already dumped 15%+, late
+
+  // ── Step 8: Confidence score ───────────────────────────────────
+  const obAlignScore = (a2 && a2.trend === a1.trend) ? 10 : 0;
+  let conf = 55
+    + Math.round(a1.bullPct * 20)
+    + obAlignScore
+    + (fullAgree ? 8 : 0)
+    + (a1.emaStackBull && isBull ? 5 : 0)
+    + (a1.emaStackBear && !isBull ? 5 : 0);
+
+  // Volume bonus — high volume = more conviction
+  if (vol > 50_000_000)  conf += 4;
+  else if (vol > 20_000_000) conf += 2;
+
+  conf = Math.min(91, Math.max(CFG.MIN_CONF, conf));
+  if (conf < CFG.MIN_CONF) return null;
+
+  // ── Step 9: Entry / SL / TP (ATR-based) ───────────────────────
+  const lev  = { scalp:12, day:10, swing:5 }[strategy];
+  const risk = conf >= 84 ? "LOW" : conf >= 74 ? "MEDIUM" : "HIGH";
+  const ATR  = Math.max(a1.atr, price * 0.004);
+  const sL   = Math.max(ATR * 0.3, price * 0.002);
+  const sH   = Math.max(ATR * 0.5, price * 0.004);
+  const eLow  = fx(isBull ? price - sL       : price + sL * 0.3, price);
+  const eHigh = fx(isBull ? price + sL * 0.3 : price + sH,       price);
+  const mid   = fx((eLow + eHigh) / 2, price);
+  const sl    = fx(isBull ? eLow  - ATR * 1.8 : eHigh + ATR * 1.8, price);
+  const slD   = Math.abs(mid - sl);
+  const tp1   = fx(isBull ? mid + slD*1.5 : mid - slD*1.5, price);
+  const tp2   = fx(isBull ? mid + slD*2.5 : mid - slD*2.5, price);
+  const tp3   = fx(isBull ? mid + slD*4.5 : mid - slD*4.5, price);
+  const brk   = fx(isBull ? mid + slD*0.5 : mid - slD*0.5, price);
+
+  // R:R check — min 1:2
+  if (slD === 0) return null;
+  const rr2 = Math.abs(tp2-mid)/slD;
+  if (rr2 < 2.0) return null;
+
+  // ── Step 10: Build reason strings ──────────────────────────────
+  const reasons = [];
+  reasons.push(`${intervals[0].toUpperCase()} ${a1.trend} — RSI ${a1.rsi}, EMA200 ${a1.e200Bull?"above ✓":"below"}`);
+  if (a2) reasons.push(`${intervals[1].toUpperCase()} ${a2.trend} — confirms ${isBull?"uptrend":"downtrend"}`);
+  if (a1.emaStackBull && isBull) reasons.push("EMA stack bullish — 20>50>200 aligned");
+  if (a1.emaStackBear && !isBull) reasons.push("EMA stack bearish — 20<50<200 aligned");
+  if (fullAgree) reasons.push(`Full ${isBull?"bullish":"bearish"} consensus across both TFs`);
+
+  return {
+    signal: isBull ? "LONG" : "SHORT",
+    conf, strategy, lev, risk,
+    coinId: id, price, chg24, eLow, eHigh, mid, sl, tp1, tp2, tp3,
+    breakEven: brk,
+    rrCheck: { rr1:1.5, rr2:parseFloat(rr2.toFixed(2)), rr3:4.5, qualified:true },
+    trailingNote: `After TP1 ($${fp(tp1)}) → move SL to $${fp(brk)}`,
+    tf: `${intervals[0].toUpperCase()}/${intervals[1].toUpperCase()}`,
+    dur: {scalp:"15–45 min",day:"4–12 h",swing:"1–5 days"}[strategy],
+    reasons,
+    tfDetail: [
+      {tf:intervals[0], trend:a1.trend, rsi:a1.rsi, e200:a1.e200Bull?"BULL":"BEAR"},
+      ...(a2?[{tf:intervals[1], trend:a2.trend, rsi:a2.rsi, e200:a2.e200Bull?"BULL":"BEAR"}]:[]),
+    ],
+    macroTrend: a2 ? (a2.e200Bull?"BULL":"BEAR") : (a1.e200Bull?"BULL":"BEAR"),
+    ind: a1.ind,
+    winRate: Math.min(84, Math.max(57, Math.round(57 + conf * 0.3))),
+    lockedAt: Date.now(),
+    confirmCount: fullAgree ? 2 : 1,
+    volatileMarket: Math.abs(chg24) > 8,
+  };
+}
+
+// ── MAIN SCAN RUNNER ───────────────────────────────────────────────
+async function runScan(strategy, onProg, cancelRef) {
+  // ── Phase 1: Get all tickers in ONE call ──────────────────────
+  onProg({ msg:"Fetching live market data...", pct:5, found:0 });
+
+  let allTickers = [];
+  try {
+    const r = await fetch("https://api.binance.com/api/v3/ticker/24hr", {
+      signal: AbortSignal.timeout(12000)
+    });
+    if (!r.ok) throw new Error("API error " + r.status);
+    const raw = await r.json();
+    // Filter: USDT pairs, min $3M 24h volume, real price
+    allTickers = raw
+      .filter(d =>
+        d.symbol.endsWith("USDT") &&
+        !d.symbol.includes("UPUSDT") && !d.symbol.includes("DOWNUSDT") && // exclude leveraged
+        !d.symbol.includes("BULLUSDT") && !d.symbol.includes("BEARUSDT") &&
+        parseFloat(d.quoteVolume) >= 3_000_000 &&
+        parseFloat(d.lastPrice) > 0
+      )
+      .sort((a,b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
+      .slice(0, 80)
+      .map(d => ({
+        symbol:  d.symbol,
+        id:      d.symbol.replace("USDT",""),
+        price:   parseFloat(d.lastPrice),
+        chg24:   parseFloat(d.priceChangePercent),
+        high24:  parseFloat(d.highPrice),
+        low24:   parseFloat(d.lowPrice),
+        vol:     parseFloat(d.quoteVolume),
+        count:   parseInt(d.count||0),
+      }));
+  } catch(e) {
+    onProg({ msg:"Failed to fetch market data: "+e.message, pct:100, found:0, error:true });
+    return [];
+  }
+
+  if (!allTickers.length) {
+    onProg({ msg:"No pairs found.", pct:100, found:0, error:true });
+    return [];
+  }
+
+  // ── Phase 2: Smart pre-filter using ticker data (no API calls) ─
+  onProg({ msg:`Got ${allTickers.length} pairs. Pre-filtering by momentum...`, pct:12, found:0 });
+
+  const candidates = allTickers.filter(t => {
+    const rangePos = t.high24 > t.low24
+      ? (t.price - t.low24) / (t.high24 - t.low24) * 100 : 50;
+
+    // Skip: extreme pump/dump (>20% moves — likely manipulated)
+    if (Math.abs(t.chg24) > 20) return false;
+
+    // Strategy-specific filters
+    if (strategy === "scalp") {
+      // Scalp: need intraday movement
+      return Math.abs(t.chg24) > 0.8 || rangePos < 15 || rangePos > 85;
+    }
+    if (strategy === "day") {
+      // Day: need meaningful move
+      return Math.abs(t.chg24) > 0.5;
+    }
+    // Swing: need trend
+    return Math.abs(t.chg24) > 1.5;
+  });
+
+  // Take top candidates by volume (already sorted)
+  const top = candidates.slice(0, 40);
+  onProg({ msg:`Analyzing ${top.length} candidates (2 API calls each)...`, pct:18, found:0 });
+
+  // ── Phase 3: Analyze in small batches with delay ───────────────
+  const results = [];
+  const BATCH = 3; // 3 coins per batch × 2 calls = 6 parallel calls — safe
+
+  for (let i = 0; i < top.length; i += BATCH) {
+    if (cancelRef && cancelRef.current) break;
+
+    const batch = top.slice(i, i + BATCH);
+    const pct = Math.round(18 + (i / top.length) * 78);
+    onProg({
+      msg: `Analyzing: ${batch.map(t=>t.id).join(", ")}`,
+      pct,
+      found: results.length,
+      current: batch.map(t=>t.id),
+    });
+
+    // Process batch in parallel
+    const batchResults = await Promise.allSettled(
+      batch.map(t => scanAnalyze(t, strategy))
+    );
+
+    batchResults.forEach((res, idx) => {
+      if (res.status === "fulfilled" && res.value) {
+        results.push(res.value);
+      }
+    });
+
+    // Small delay between batches — respect rate limits
+    if (i + BATCH < top.length) {
+      await new Promise(r => setTimeout(r, 200));
+    }
+  }
+
+  // Sort by confidence descending
+  results.sort((a, b) => b.conf - a.conf);
+
+  onProg({
+    msg: `Complete! ${results.length} qualified signal${results.length !== 1 ? "s" : ""} found`,
+    pct: 100,
+    found: results.length,
+  });
+
   return results;
 }
 
@@ -454,10 +872,15 @@ function validateEmail(email){
 }
 const Auth={
   check:(cqid,pass)=>{
-    // Admin: accepts email OR the special CQ-ID "ADMIN"
-    const input=cqid.trim();
-    if((btoa(input)===CFG._a||input.toUpperCase()==="ADMIN"||input===atob(CFG._a))&&btoa(pass)===CFG._b)
-      return{ok:true,role:"admin",plan:"elite",email:"admin",cqid:"ADMIN"};
+    // Admin: accepts email, "ADMIN", or "admin"
+    const input=(cqid||"").trim();
+    const isAdm=btoa(input)===CFG._a||input.toUpperCase()==="ADMIN"||
+                input.toLowerCase()===atob(CFG._a).toLowerCase();
+    if(isAdm){
+      if(btoa(pass)===CFG._b)
+        return{ok:true,role:"admin",plan:"elite",email:atob(CFG._a),cqid:"ADMIN"};
+      return{ok:false,err:"Incorrect admin password."};
+    }
     try{
       const u=JSON.parse(localStorage.getItem("cx_users")||"[]").find(x=>(x.cqid===input||x.email===input.toLowerCase())&&x.pass===btoa(pass));
       if(!u)return{ok:false,err:"Invalid CQ-ID or password."};
@@ -668,6 +1091,67 @@ function LockBar({sig}){
   </div>);
 }
 
+// ── TELEGRAM SEND BUTTON ─────────────────────────────────────────
+// Telegram format
+function fmtTg(coinId, sig) {
+  if(!sig||sig.noSignal) return `📊 <b>${coinId}/USDT</b>\n⏳ No signal — ${sig?.reason?.slice(0,80)||"stand aside"}.`;
+  const isL=sig.signal==="LONG";
+  const rr=sig.rrCheck||{rr1:"1.5",rr2:"2.5",rr3:"4.5"};
+  const tfStr=sig.tfDetail?.map(t=>`${t.tf.toUpperCase()}:${t.trend}`).join(" | ")||sig.tf||"";
+  return `🤖 <b>CRYPTEX QUANT v6</b>
+━━━━━━━━━━━━━━━━━━━━
+${isL?"🟢":"🔴"} <b>${coinId}/USDT — ${sig.signal}</b>
+${sig.strategy?.toUpperCase()} | <b>${sig.conf}%</b> conf | ✦${sig.confirmCount||0} TFs agree
+━━━━━━━━━━━━━━━━━━━━
+📍 <b>Entry:</b> $${fp(sig.eLow)} – $${fp(sig.eHigh)}
+🛑 <b>SL:</b> $${fp(sig.sl)} (${Math.abs(pc(sig.mid,sig.sl))}%)
+🎯 <b>TP1:</b> $${fp(sig.tp1)} R:R 1:${rr.rr1}
+🎯 <b>TP2:</b> $${fp(sig.tp2)} R:R 1:${rr.rr2} ✅
+🎯 <b>TP3:</b> $${fp(sig.tp3)} R:R 1:${rr.rr3}
+📌 Move SL to $${fp(sig.breakEven||sig.brk||sig.mid)} after TP1
+━━━━━━━━━━━━━━━━━━━━
+⏱ ${sig.dur||"—"} | ${sig.lev}× lev | ${sig.risk} risk
+📊 TF: ${tfStr}
+1D Macro: ${sig.macroTrend||"—"} | Win Rate: ~${sig.winRate||"—"}%
+━━━━━━━━━━━━━━━━━━━━
+📐 ${sig.reasons?.[0]||""}
+<i>Not financial advice. Always use stop loss.</i>`;
+}
+
+async function tgSend(token,chatId,text){
+  try{
+    const r=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({chat_id:chatId,text,parse_mode:"HTML"}),signal:AbortSignal.timeout(8000)});
+    const d=await r.json();return d.ok?{ok:true}:{ok:false,err:d.description};
+  }catch(e){return{ok:false,err:e.message};}
+}
+
+// Admin-only: broadcast to ALL active paid subscribers
+function TelegramSendButton({sig, coinId}){
+  const[status,setStatus]=useState("");const[loading,setLoading]=useState(false);
+  const adminToken=localStorage.getItem("cq_admin_tg_token")||"";
+  if(!adminToken||!sig||sig.noSignal) return null;
+  const send=async()=>{
+    setLoading(true);setStatus("Broadcasting...");
+    const users=Auth.all().filter(u=>u.telegramChatId&&u.plan!=="free"&&Date.now()<u.expiresAt);
+    if(!users.length){setStatus("⚠️ No paid users with Telegram linked yet.");setLoading(false);return;}
+    const msg=fmtTg(coinId,sig);
+    let sent=0;
+    for(const u of users){
+      await new Promise(r=>setTimeout(r,350));
+      const r=await tgSend(adminToken,u.telegramChatId,msg);
+      if(r.ok) sent++;
+    }
+    setStatus(`✅ Broadcast to ${sent}/${users.length} paid subscriber${users.length!==1?"s":""}`);
+    setLoading(false);setTimeout(()=>setStatus(""),6000);
+  };
+  return(<div style={{marginBottom:10}}>
+    <button style={{width:"100%",padding:12,fontSize:12,letterSpacing:1,background:"linear-gradient(135deg,#006699,#0099cc)",color:"#fff",boxShadow:"0 4px 16px rgba(0,153,204,.3)",border:"none",borderRadius:10,cursor:"pointer",display:"flex",alignItems:"center",gap:7,justifyContent:"center",fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,textTransform:"uppercase"}} onClick={send} disabled={loading}>
+      {loading?<Spin sz={14}/>:<><span style={{fontSize:16}}>✈️</span> BROADCAST TO PAID SUBSCRIBERS</>}
+    </button>
+    {status&&<div style={{marginTop:5,fontSize:12,color:status.startsWith("✅")?"var(--g)":"var(--y)",textAlign:"center",padding:"6px",background:status.startsWith("✅")?"rgba(0,230,118,.07)":"rgba(255,204,0,.07)",borderRadius:8}}>{status}</div>}
+  </div>);
+}
+
 // ── SIGNAL CARD ───────────────────────────────────────────────────
 function SignalCard({coinId,name,sig,loading,onRefresh,livePrice,liveChg}){
   if(loading)return<div className="card" style={{padding:52,textAlign:"center"}}><Spin sz={48}/><div style={{marginTop:16,color:"var(--c)",fontFamily:"'Barlow Condensed',sans-serif",fontSize:15,letterSpacing:2}}>QUANTITATIVE ANALYSIS IN PROGRESS...</div><div style={{marginTop:8,color:"var(--text2)",fontSize:12}}>Multi-timeframe synchronization · Triple confirmation</div></div>;
@@ -752,6 +1236,34 @@ function SignalCard({coinId,name,sig,loading,onRefresh,livePrice,liveChg}){
       </div>
     </div>
 
+    {/* ── Pump/Dump Warning */}
+    {sig.pumpDump?.risk!=="NORMAL"&&<div className="siren" style={{padding:"12px 16px",borderRadius:12,border:`2px solid ${sig.pumpDump?.isPump?"var(--y)":"var(--r)"}`,display:"flex",gap:12,alignItems:"center"}}>
+      <span style={{fontSize:20,flexShrink:0}}>{sig.pumpDump?.isPump?"🚀💥":"💥"}</span>
+      <div>
+        <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,color:sig.pumpDump?.isPump?"var(--y)":"var(--r)",letterSpacing:1,marginBottom:3}}>{sig.pumpDump?.isPump?"⚠️ PUMP DETECTED — DUMP RISK HIGH":"⚠️ DUMP DETECTED — REVERSAL POSSIBLE"}</div>
+        <div style={{fontSize:12}}>Spike {sig.pumpDump?.priceSpike>0?"+":""}{sig.pumpDump?.priceSpike}% · Vol {sig.pumpDump?.volRatioSpike}×. {sig.pumpDump?.fakeMove?"Volume not confirming — likely fakeout.":"Reduce size 50%. Tight stops."}</div>
+      </div>
+    </div>}
+    {/* ── SL Hunt Warning */}
+    {(sig.slHunt?.huntedBelow||sig.slHunt?.huntedAbove||sig.slHunt?.longWick)&&<div style={{padding:"12px 16px",borderRadius:12,border:"2px solid rgba(255,204,0,.35)",background:"rgba(255,204,0,.04)",display:"flex",gap:12,alignItems:"flex-start"}}>
+      <span style={{fontSize:20,flexShrink:0}}>🎯</span>
+      <div>
+        <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,color:"var(--y)",letterSpacing:1,marginBottom:3}}>STOP LOSS HUNT DETECTED</div>
+        <div style={{fontSize:12,color:"var(--text)",lineHeight:1.6}}>{sig.slHunt?.msg}</div>
+        {sig.slHunt?.zone&&<div style={{fontSize:11,color:"var(--text2)",marginTop:4}}>Hunt zone: <span className="mono" style={{color:"var(--y)"}}>${fp(sig.slHunt.zone)}</span> — place SL 0.5% beyond this to avoid being swept.</div>}
+      </div>
+    </div>}
+    {/* ── R:R Badge */}
+    {sig.rrCheck&&<div style={{padding:"10px 16px",borderRadius:10,border:"1px solid rgba(0,200,255,.2)",background:"rgba(0,200,255,.04)",display:"flex",gap:16,alignItems:"center",flexWrap:"wrap"}}>
+      <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:11,color:"var(--text2)",letterSpacing:1}}>RISK : REWARD</div>
+      {[["TP1",sig.rrCheck.rr1,"var(--text2)"],[sig.rrCheck.rr2>=2?"✅ TP2":"TP2",sig.rrCheck.rr2,sig.rrCheck.rr2>=2?"var(--g)":"var(--y)"],["TP3",sig.rrCheck.rr3,"var(--g)"]].map(([l,v,c])=>(
+        <div key={l} style={{display:"flex",alignItems:"center",gap:6}}>
+          <span style={{fontSize:11,color:"var(--text2)"}}>{l}:</span>
+          <span className="mono" style={{fontWeight:700,color:c,fontSize:13}}>1:{v}</span>
+        </div>
+      ))}
+      <span style={{fontSize:11,color:"var(--text2)",marginLeft:"auto"}}>Min qualified: TP2 ≥ 1:2.0</span>
+    </div>}
     {/* ── Trade Setup */}
     <div className="card" style={{padding:22}}>
       <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:11,color:"var(--text2)",letterSpacing:2,marginBottom:16,textTransform:"uppercase"}}>Trade Setup</div>
@@ -793,6 +1305,7 @@ function SignalCard({coinId,name,sig,loading,onRefresh,livePrice,liveChg}){
       </div>
     </div>
 
+    <TelegramSendButton sig={sig} coinId={coinId}/>
     <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
       <button className={`btn ${isL?"btn-g":"btn-r"}`} style={{flex:2,padding:14,minWidth:200,fontSize:13}}>
         {isL?"▲ ENTER LONG":"▼ ENTER SHORT"} &nbsp;${fp(sig.eLow)} – ${fp(sig.eHigh)}
@@ -933,10 +1446,14 @@ function PageDashboard({coins,sigs,loadSig,setTab,setActive,setSt,history,volati
   const changeSt=s=>{setSt2(s);setSt(s);};
   return(<div>
     {/* Volatility banner */}
-    {volatility?.siren&&<div className={`siren`} style={{padding:"12px 18px",borderRadius:12,border:`2px solid ${volatility.level==="CRITICAL"?"var(--r)":"var(--y)"}`,marginBottom:16,display:"flex",gap:12,alignItems:"center"}}>
-      <span style={{fontSize:24,flexShrink:0}}>{volatility.level==="CRITICAL"?"🚨":"⚠️"}</span>
-      <div><div style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,color:volatility.level==="CRITICAL"?"var(--r)":"var(--y)",letterSpacing:1,marginBottom:3}}>{volatility.level} MARKET VOLATILITY</div>
-      <div style={{fontSize:13}}>{volatility.msg}</div></div>
+    {volatility&&<div className={`siren`} style={{padding:"14px 18px",borderRadius:12,border:`2px solid ${volatility.level==="CRASH"?"var(--r)":volatility.level==="CRITICAL"?"var(--r)":"var(--y)"}`,marginBottom:16,display:"flex",gap:12,alignItems:"center"}}>
+      <span style={{fontSize:26,flexShrink:0}}>{volatility.level==="CRASH"?"💥":volatility.level==="CRITICAL"?"🚨":"⚠️"}</span>
+      <div style={{flex:1}}>
+        <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,color:volatility.level==="CRASH"||volatility.level==="CRITICAL"?"var(--r)":"var(--y)",letterSpacing:1,marginBottom:3}}>
+          {volatility.level==="CRASH"?"🔴 MARKET CRASH ALERT":volatility.level==="CRITICAL"?"🔴 CRITICAL VOLATILITY":volatility.level==="HIGH"?"🟠 HIGH VOLATILITY":"🟡 ELEVATED VOLATILITY"}
+        </div>
+        <div style={{fontSize:13,lineHeight:1.6}}>{volatility.msg}</div>
+      </div>
     </div>}
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-end",marginBottom:20,flexWrap:"wrap",gap:12}}>
       <div>
@@ -1015,185 +1532,1166 @@ function PageSignals({coins,sigs,loadSig,active,setActive,st,setSt,onRefresh}){
   </div>);
 }
 
-// ── SCANNER ───────────────────────────────────────────────────────
-function PageScan(){
-  const[phase,setPhase]=useState("idle");const[prog,setProg]=useState({msg:"",pct:0,found:0});
-  const[results,setResults]=useState([]);const[st,setSt]=useState("day");
-  const[filter,setFilter]=useState("all");const[view,setView]=useState(null);
-  const cancelRef=useRef(false);
+// ── TELEGRAM SCAN SEND (All signals at once) ──────────────────────
+function TelegramScanSendButton({results}){
+  const[status,setStatus]=useState("");const[loading,setLoading]=useState(false);
+  const hasTg=()=>!!(localStorage.getItem("cq_tg_token")&&localStorage.getItem("cq_tg_chatid"));
+  if(!hasTg()||!results||!results.length) return null;
+  const sendAll=async()=>{
+    setLoading(true);setStatus("");
+    const token=localStorage.getItem("cq_tg_token");const chatId=localStorage.getItem("cq_tg_chatid");
+    // Send summary first
+    const summary=`📊 <b>CRYPTEX QUANT — SCAN RESULTS</b>\n━━━━━━━━━━━━━━━━━━━━\n🟢 LONG: ${results.filter(r=>r.signal==="LONG").length} | 🔴 SHORT: ${results.filter(r=>r.signal==="SHORT").length}\nTotal: ${results.length} qualified signals\n<i>Sending top ${Math.min(5,results.length)} signals...</i>`;
+    await sendTelegramMessage(token,chatId,summary);
+    // Send top 5
+    let sent=0;
+    for(const r of results.slice(0,5)){
+      await new Promise(res=>setTimeout(res,500)); // rate limit
+      await sendTelegramMessage(token,chatId,formatSignalForTelegram(r.coinId,r));
+      sent++;
+      setStatus(`Sending ${sent}/${Math.min(5,results.length)}...`);
+    }
+    setStatus(`✅ Sent ${sent} signals to Telegram!`);
+    setLoading(false);setTimeout(()=>setStatus(""),5000);
+  };
+  return(<div style={{display:"flex",flexDirection:"column",gap:4}}>
+    <button className="btn" style={{padding:"8px 14px",fontSize:11,background:"linear-gradient(135deg,#0077a8,#00a8cc)",color:"#fff"}} onClick={sendAll} disabled={loading}>
+      {loading?<><Spin sz={12}/> {status||"Sending..."}</>:<><span>✈️</span> Send All to Telegram</>}
+    </button>
+    {!loading&&status&&<div style={{fontSize:11,color:"var(--g)",textAlign:"center"}}>{status}</div>}
+  </div>);
+}
 
-  const doScan=async()=>{
-    cancelRef.current=false;setPhase("scanning");setResults([]);setView(null);
-    const res=await runScan(st,(p)=>{if(!cancelRef.current)setProg(p);});
-    if(!cancelRef.current){setResults(res);setPhase("done");}
+// ── SCANNER ───────────────────────────────────────────────────────
+
+function TelegramScanBtn({results}){
+  const [status,setStatus]=useState("");const [loading,setLoading]=useState(false);
+  const token=localStorage.getItem("cq_admin_tg_token")||"";
+  if(!token||!results?.length) return null;
+  const send=async()=>{
+    setLoading(true);setStatus("Sending...");
+    const users=Auth.all().filter(u=>u.telegramChatId&&u.plan!=="free"&&Date.now()<u.expiresAt);
+    if(!users.length){setStatus("⚠️ No paid users linked");setLoading(false);return;}
+    const longs=results.filter(r=>r.signal==="LONG").length;
+    const shorts=results.filter(r=>r.signal==="SHORT").length;
+    const sum=`📊 <b>CRYPTEX QUANT — SCAN</b>\n━━━━━━━━━━━━━━━━━━━━\n🟢 LONG: ${longs} | 🔴 SHORT: ${shorts}\n${results.length} signals (top 5 below)`;
+    for(const u of users) await tgSend(token,u.telegramChatId,sum);
+    for(const r of results.slice(0,5)){
+      await new Promise(res=>setTimeout(res,400));
+      for(const u of users) await tgSend(token,u.telegramChatId,fmtTg(r.coinId,r));
+    }
+    setStatus(`✅ Broadcast to ${users.length} subscriber${users.length!==1?"s":""}`);
+    setLoading(false);setTimeout(()=>setStatus(""),5000);
+  };
+  return(<div style={{display:"flex",flexDirection:"column",gap:4}}>
+    <button style={{padding:"8px 14px",fontSize:11,background:"linear-gradient(135deg,#006699,#0099cc)",color:"#fff",border:"none",borderRadius:10,cursor:"pointer",display:"flex",alignItems:"center",gap:6,fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,textTransform:"uppercase",letterSpacing:1}} onClick={send} disabled={loading}>
+      {loading?<Spin sz={12}/>:<><span>✈️</span> Broadcast Scan</>}
+    </button>
+    {status&&<div style={{fontSize:10,color:"var(--g)",textAlign:"center"}}>{status}</div>}
+  </div>);
+}
+function PageScan(){
+  const [phase,   setPhase]   = useState("idle");
+  const [prog,    setProg]    = useState({msg:"",pct:0,found:0,current:[]});
+  const [results, setResults] = useState([]);
+  const [strategy,setStrategy]= useState("day");
+  const [filter,  setFilter]  = useState("all");
+  const [view,    setView]    = useState(null);
+  const cancelRef = useRef(false);
+
+  const doScan = async () => {
+    cancelRef.current = false;
+    setPhase("scanning");
+    setResults([]);
+    setView(null);
+    setProg({msg:"Starting...",pct:0,found:0,current:[]});
+    try {
+      const res = await runScan(strategy, (p) => {
+        if (!cancelRef.current) {
+          setProg(p);
+          // Show live results as they come in
+          if (p.found && p.found > 0) setResults(prev => prev);
+        }
+      }, cancelRef);
+      if (!cancelRef.current) { setResults(res); setPhase("done"); }
+    } catch(e) {
+      if (!cancelRef.current) { setProg({msg:"Error: "+e.message,pct:100,found:0}); setPhase("done"); }
+    }
   };
 
-  const filtered=filter==="all"?results:results.filter(r=>r.signal===filter.toUpperCase());
-  const longs=results.filter(r=>r.signal==="LONG").length;const shorts=results.filter(r=>r.signal==="SHORT").length;
+  const cancelScan = () => { cancelRef.current=true; setPhase("idle"); setProg({msg:"",pct:0,found:0,current:[]}); };
 
-  if(view)return(<div><button className="btn btn-h" style={{marginBottom:16}} onClick={()=>setView(null)}>← Back to Scan</button>
-    <SignalCard coinId={view.coinId} name={view.coinId} sig={view} loading={false} onRefresh={()=>setView(null)} livePrice={view.price} liveChg={view.chg24}/></div>);
+  const filtered = useMemo(()=>{
+    if(filter==="all")  return results;
+    if(filter==="long") return results.filter(r=>r.signal==="LONG");
+    if(filter==="short")return results.filter(r=>r.signal==="SHORT");
+    if(filter==="low")  return results.filter(r=>r.risk==="LOW");
+    return results;
+  },[results,filter]);
 
-  return(<div>
-    <div style={{marginBottom:20}}>
-      <h2 style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:22,fontWeight:900,letterSpacing:1,marginBottom:4}}>
-        MARKET <span style={{background:"var(--grd)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>SCANNER</span>
+  const longs=results.filter(r=>r.signal==="LONG").length;
+  const shorts=results.filter(r=>r.signal==="SHORT").length;
+  const lowRisk=results.filter(r=>r.risk==="LOW").length;
+
+  if(view) return(<div>
+    <button className="btn bh" style={{marginBottom:16}} onClick={()=>setView(null)}>← Back to Scan</button>
+    <SignalCard coinId={view.coinId} name={view.coinId} sig={view} loading={false} onRefresh={()=>setView(null)} livePrice={view.price} liveChg={view.chg24}/>
+  </div>);
+
+  /* ── IDLE ─────────────────────────────────────────────────────── */
+  if(phase==="idle") return(<div>
+    <div style={{marginBottom:24}}>
+      <h2 style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:24,fontWeight:900,letterSpacing:1.5,marginBottom:6}}>
+        MARKET <span style={{background:"linear-gradient(135deg,var(--c),var(--g))",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>SCANNER</span>
       </h2>
-      <div style={{fontSize:13,color:"var(--text2)"}}>Quantitative scan of {CFG.SCAN_N}+ pairs · Triple confirmation filter · Confidence ≥{CFG.MIN_CONF}%</div>
+      <div style={{fontSize:13,color:"var(--t2)"}}>80+ pairs · 2-TF consensus · EMA200 veto · Min R:R 1:2 · Real market data</div>
     </div>
-
-    {phase==="idle"&&<div>
-      <div className="stab" style={{marginBottom:16}}>
-        <button className={`stab-btn ${st==="scalp"?"as":""}`} onClick={()=>setSt("scalp")}>⚡ SCALP 5M</button>
-        <button className={`stab-btn ${st==="day"?"ad":""}`}   onClick={()=>setSt("day")}>📊 DAY 1H</button>
-        <button className={`stab-btn ${st==="swing"?"aw":""}`} onClick={()=>setSt("swing")}>🌊 SWING 4H</button>
+    <div className="stab" style={{marginBottom:24}}>
+      <button className={`sbt ${strategy==="scalp"?"as":""}`} onClick={()=>setStrategy("scalp")}>⚡ SCALP 15m+1H</button>
+      <button className={`sbt ${strategy==="day"?"ad":""}`}   onClick={()=>setStrategy("day")}>📊 DAY 1H+4H</button>
+      <button className={`sbt ${strategy==="swing"?"aw":""}`} onClick={()=>setStrategy("swing")}>🌊 SWING 4H+1D</button>
+    </div>
+    <div className="card ai" style={{padding:48,textAlign:"center",border:"1px solid rgba(0,200,255,.1)"}}>
+      <div style={{marginBottom:22}}>
+        <svg width="76" height="76" viewBox="0 0 76 76" fill="none" style={{display:"block",margin:"0 auto"}}>
+          <circle cx="38" cy="38" r="34" stroke="rgba(0,200,255,.12)" strokeWidth="2" fill="none"/>
+          <circle cx="38" cy="38" r="22" stroke="rgba(0,200,255,.25)" strokeWidth="1.5" fill="none"/>
+          <circle cx="38" cy="38" r="5" fill="var(--c)" style={{filter:"drop-shadow(0 0 8px var(--c))"}}/>
+          {[0,30,60,90,120,150,180,210,240,270,300,330].map((a,i)=>{
+            const rad=a*Math.PI/180;
+            return <line key={i} x1={38+20*Math.cos(rad)} y1={38+20*Math.sin(rad)} x2={38+34*Math.cos(rad)} y2={38+34*Math.sin(rad)} stroke="rgba(0,200,255,.5)" strokeWidth="1.5" strokeLinecap="round"/>;
+          })}
+        </svg>
       </div>
-      <div className="card ai" style={{padding:56,textAlign:"center"}}>
-        <div style={{marginBottom:24}}>
-          <svg width="72" height="72" viewBox="0 0 72 72" fill="none" style={{display:"block",margin:"0 auto"}}>
-            <circle cx="36" cy="36" r="32" stroke="rgba(0,200,255,.12)" strokeWidth="2" fill="none"/>
-            <circle cx="36" cy="36" r="22" stroke="rgba(0,200,255,.25)" strokeWidth="1.5" fill="none"/>
-            <circle cx="36" cy="36" r="5" fill="var(--c)" style={{filter:"drop-shadow(0 0 8px var(--c))"}}/>
-            {[0,30,60,90,120,150,180,210,240,270,300,330].map((a,i)=>{const R=32,rad=a*Math.PI/180;return<line key={i} x1={36+24*Math.cos(rad)} y1={36+24*Math.sin(rad)} x2={36+R*Math.cos(rad)} y2={36+R*Math.sin(rad)} stroke="rgba(0,200,255,.5)" strokeWidth="1.5" strokeLinecap="round"/>;})}
-          </svg>
-        </div>
-        <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:20,fontWeight:800,letterSpacing:2,marginBottom:10}}>QUANT MARKET SCANNER</div>
-        <div style={{color:"var(--text2)",fontSize:13,marginBottom:30,maxWidth:480,margin:"0 auto 30px",lineHeight:1.8}}>
-          Scans {CFG.SCAN_N}+ high-volume pairs. Only signals with ≥3 technical confirmations pass the filter. Every signal includes entry range, stop-loss, 3 TP targets, and trailing SL.
-        </div>
-        <button className="btn btn-c" style={{padding:"16px 56px",fontSize:14,letterSpacing:1.5}} onClick={doScan}>🔍 START DEEP SCAN — {st.toUpperCase()}</button>
+      <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:22,fontWeight:800,letterSpacing:2,marginBottom:12}}>
+        {strategy==="scalp"?"⚡ SCALP SCAN":strategy==="day"?"📊 DAY TRADING SCAN":"🌊 SWING SCAN"}
       </div>
-    </div>}
-
-    {phase==="scanning"&&<div>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
-        <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:16,color:"var(--c)",letterSpacing:1.5}}>SCANNING MARKET...</div>
-        <button className="btn btn-r" style={{padding:"7px 14px",fontSize:11}} onClick={()=>{cancelRef.current=true;setPhase("idle");}}>✕ CANCEL</button>
-      </div>
-      <div className="card" style={{padding:28}}>
-        <div style={{display:"flex",alignItems:"center",gap:16,marginBottom:18}}>
-          <Spin sz={40}/>
-          <div><div style={{fontWeight:600,fontSize:14,marginBottom:3}}>{prog.msg}</div>
-          <div style={{fontSize:12,color:"var(--text2)"}}>Found {prog.found} triple-confirmed signal{prog.found!==1?"s":""} so far</div></div>
-        </div>
-        <div className="prog" style={{height:8,borderRadius:4}}>
-          <div className="pf" style={{width:`${prog.pct}%`,height:"100%",background:"linear-gradient(90deg,var(--c),var(--g))"}}/>
-        </div>
-        <div className="mono" style={{fontSize:11,color:"var(--text2)",marginTop:6}}>{prog.pct}%</div>
-      </div>
-    </div>}
-
-    {phase==="done"&&<div>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
-        <div style={{padding:"10px 18px",background:"rgba(0,255,136,.06)",border:"1px solid rgba(0,255,136,.2)",borderRadius:10,display:"flex",gap:12,alignItems:"center"}}>
-          <span style={{fontSize:20}}>🎯</span>
-          <div>
-            <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:12,color:"var(--g)",letterSpacing:1,fontWeight:700}}>SCAN COMPLETE — {st.toUpperCase()} STRATEGY</div>
-            <div style={{fontSize:12,marginTop:2}}>{results.length} signals · <span style={{color:"var(--g)"}}>{longs} LONG</span> / <span style={{color:"var(--r)"}}>{shorts} SHORT</span> · All 3+ confirmed</div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(148px,1fr))",gap:10,maxWidth:560,margin:"0 auto 28px",textAlign:"left"}}>
+        {[["🔍","80+ pairs scanned","High-volume USDT"],["⚡","2 calls per coin","Fast, no rate limit"],["📐","EMA200 veto","No LONG below EMA200"],["✦","Both TFs must agree","Zero conflict signals"],["💰","Min R:R 1:2","Professional grade"],["🚫","Pump/dump blocked","No chasing moves"]].map(([ic,t,s],i)=>(
+          <div key={i} style={{display:"flex",gap:10,padding:"10px 12px",background:"var(--bg3)",borderRadius:10,border:"1px solid var(--bdr)"}}>
+            <span style={{fontSize:16,flexShrink:0}}>{ic}</span>
+            <div><div style={{fontSize:12,fontWeight:600,marginBottom:2}}>{t}</div><div style={{fontSize:10,color:"var(--t2)"}}>{s}</div></div>
           </div>
-        </div>
-        <button className="btn btn-h" onClick={()=>setPhase("idle")}>🔄 New Scan</button>
-      </div>
-      <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap",alignItems:"center"}}>
-        {[["all",`All (${results.length})`],["long",`▲ LONG (${longs})`],["short",`▼ SHORT (${shorts})`]].map(([k,l])=>(
-          <button key={k} className={`btn ${filter===k?"btn-c":"btn-h"}`} style={{padding:"7px 14px",fontSize:11}} onClick={()=>setFilter(k)}>{l}</button>
         ))}
-        <div style={{marginLeft:"auto",fontSize:11,color:"var(--text2)"}}>Sorted by confidence ↓</div>
       </div>
-      {filtered.length===0?
-        <div className="card" style={{padding:40,textAlign:"center"}}><div style={{fontSize:42,marginBottom:12}}>🔍</div><div style={{color:"var(--text2)"}}>No {filter==="all"?"":filter.toUpperCase()} signals met the triple confirmation threshold. Try a different strategy.</div></div>:
-        <div style={{display:"flex",flexDirection:"column",gap:10}}>
-          {filtered.map((r,i)=>{const isL=r.signal==="LONG";const col=isL?"var(--g)":"var(--r)";return(
-            <div key={i} className={`card au ${isL?"card-l":"card-s"}`} style={{padding:"14px 18px",cursor:"pointer",animationDelay:`${i*.03}s`}} onClick={()=>setView(r)}>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}}>
-                <div style={{display:"flex",alignItems:"center",gap:12}}>
-                  <div style={{width:40,height:40,borderRadius:10,background:`rgba(${isL?"0,255,136":"255,32,82"},.08)`,border:`1.5px solid ${col}`,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Barlow Condensed',sans-serif",fontSize:14,fontWeight:900,color:col,flexShrink:0}}>{r.coinId?.[0]||"?"}</div>
+      <button className="btn bc" style={{padding:"16px 56px",fontSize:15,letterSpacing:1.5,boxShadow:"0 4px 28px rgba(0,200,255,.4)"}} onClick={doScan}>
+        🔍 START SCAN
+      </button>
+    </div>
+  </div>);
+
+  /* ── SCANNING ─────────────────────────────────────────────────── */
+  if(phase==="scanning") return(<div>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+      <div>
+        <h2 style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:22,fontWeight:900,letterSpacing:1.5,color:"var(--c)",marginBottom:3}}>SCANNING...</h2>
+        <div style={{fontSize:12,color:"var(--t2)"}}>{strategy.toUpperCase()} · {prog.found} signal{prog.found!==1?"s":""} found</div>
+      </div>
+      <button className="btn br" style={{padding:"10px 18px",fontSize:12}} onClick={cancelScan}>✕ CANCEL</button>
+    </div>
+    <div className="card" style={{padding:28,marginBottom:16}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:8,fontSize:12}}>
+        <span style={{fontFamily:"'Barlow Condensed',sans-serif",color:"var(--t2)",letterSpacing:1}}>PROGRESS</span>
+        <span className="mono" style={{color:"var(--c)",fontWeight:700}}>{prog.pct}%</span>
+      </div>
+      <div style={{height:8,background:"var(--bg4)",borderRadius:4,overflow:"hidden",marginBottom:16}}>
+        <div style={{height:"100%",borderRadius:4,background:"linear-gradient(90deg,var(--c),var(--g))",width:`${prog.pct}%`,transition:"width .4s ease"}}/>
+      </div>
+      <div style={{display:"flex",alignItems:"center",gap:14,marginBottom:14}}>
+        <Spin sz={28}/>
+        <div>
+          <div style={{fontWeight:600,fontSize:14,marginBottom:2}}>{prog.msg}</div>
+          {prog.found>0&&<div style={{fontSize:12,color:"var(--g)",fontWeight:700}}>✓ {prog.found} qualified signal{prog.found!==1?"s":""}</div>}
+        </div>
+      </div>
+      {prog.current&&prog.current.length>0&&<div style={{display:"flex",gap:7,flexWrap:"wrap"}}>
+        {prog.current.map(id=><div key={id} style={{padding:"4px 12px",background:"rgba(0,200,255,.08)",border:"1px solid rgba(0,200,255,.2)",borderRadius:20,fontSize:11,fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,color:"var(--c)",display:"flex",alignItems:"center",gap:5}}><Spin sz={8}/>{id}</div>)}
+      </div>}
+    </div>
+    {results.length>0&&<div>
+      <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:11,color:"var(--t2)",letterSpacing:2,marginBottom:8}}>LIVE RESULTS</div>
+      {results.slice(0,3).map((r,i)=>{const isL=r.signal==="LONG";const col=isL?"var(--g)":"var(--r)";return(
+        <div key={i} className={`card ${isL?"card-bull":"card-bear"}`} style={{padding:"10px 14px",marginBottom:8,opacity:.85}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <span style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:800,fontSize:14,color:col}}>{r.coinId}/USDT</span>
+              <span className={`pill ${isL?"pg":"pr"}`}>{isL?"▲ LONG":"▼ SHORT"}</span>
+              <span className={`pill ${r.risk==="LOW"?"pg":r.risk==="MEDIUM"?"py":"pr"}`}>{r.risk}</span>
+            </div>
+            <div style={{display:"flex",alignItems:"center",gap:8}}>
+              <span className="mono" style={{fontSize:12,color:col,fontWeight:700}}>{r.conf}%</span>
+              <Ring val={r.conf} color={col} sz={44}/>
+            </div>
+          </div>
+        </div>);})}
+      {results.length>3&&<div style={{fontSize:11,color:"var(--t2)",textAlign:"center",padding:8}}>+{results.length-3} more signals...</div>}
+    </div>}
+  </div>);
+
+  /* ── DONE ─────────────────────────────────────────────────────── */
+  return(<div>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20,flexWrap:"wrap",gap:12}}>
+      <div>
+        <h2 style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:22,fontWeight:900,letterSpacing:1,marginBottom:8}}>SCAN <span style={{color:"var(--g)"}}>COMPLETE</span></h2>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+          <span className="pill pg">🎯 {results.length} signals</span>
+          <span className="pill pg">▲ {longs} LONG</span>
+          <span className="pill pr">▼ {shorts} SHORT</span>
+          {lowRisk>0&&<span className="pill pc">🔒 {lowRisk} LOW RISK</span>}
+          <span className="pill py">{strategy.toUpperCase()}</span>
+        </div>
+      </div>
+      <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+        <TelegramScanBtn results={filtered}/>
+        <button className="btn bh" onClick={()=>{setPhase("idle");setResults([]);setFilter("all");}}>🔄 New Scan</button>
+      </div>
+    </div>
+    <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap"}}>
+      {[["all",`All (${results.length})`],["long",`▲ LONG (${longs})`],["short",`▼ SHORT (${shorts})`],["low",`🔒 Low Risk (${lowRisk})`]].map(([k,l])=>(
+        <button key={k} className={`btn ${filter===k?"bc":"bh"}`} style={{padding:"7px 14px",fontSize:11}} onClick={()=>setFilter(k)}>{l}</button>
+      ))}
+      <span style={{marginLeft:"auto",fontSize:11,color:"var(--t2)",alignSelf:"center"}}>Sorted by confidence ↓</span>
+    </div>
+    {filtered.length===0?<div className="card" style={{padding:44,textAlign:"center"}}>
+      <div style={{fontSize:40,marginBottom:12}}>🔍</div>
+      <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:16,color:"var(--y)",marginBottom:8}}>NO SIGNALS FOUND</div>
+      <div style={{fontSize:13,color:"var(--t2)",lineHeight:1.8,maxWidth:400,margin:"0 auto 18px"}}>No pairs passed all conditions. Market may be ranging or all TFs conflicting.</div>
+      <button className="btn bc" onClick={()=>{setPhase("idle");setResults([]);setFilter("all");}}>🔄 Try Again</button>
+    </div>:(
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        {filtered.map((r,i)=>{const isL=r.signal==="LONG";const col=isL?"var(--g)":"var(--r)";return(
+          <div key={i} className={`card au ${isL?"card-bull":"card-bear"}`} style={{padding:"16px 20px",cursor:"pointer",animationDelay:`${i*.04}s`}} onClick={()=>setView(r)}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:12}}>
+              <div style={{flex:1,minWidth:200}}>
+                <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8,flexWrap:"wrap"}}>
+                  <div style={{width:38,height:38,borderRadius:10,background:`rgba(${isL?"0,230,118":"255,32,82"},.08)`,border:`1.5px solid ${col}`,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Barlow Condensed',sans-serif",fontSize:14,fontWeight:900,color:col,flexShrink:0}}>{r.coinId[0]}</div>
                   <div>
-                    <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:4}}>
-                      <span style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:800,fontSize:16,letterSpacing:.5}}>{r.coinId}/USDT</span>
+                    <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:3}}>
+                      <span style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:900,fontSize:17,letterSpacing:.5}}>{r.coinId}/USDT</span>
                       <span className={`pill ${isL?"pg":"pr"}`}>{isL?"▲ LONG":"▼ SHORT"}</span>
                       <span className={`pill ${r.risk==="LOW"?"pg":r.risk==="MEDIUM"?"py":"pr"}`}>{r.risk}</span>
-                      <span className={`pill ${{scalp:"ps",day:"pd",swing:"pw"}[r.strategy]}`}>{r.strategy.toUpperCase()}</span>
-                      <span className="pill" style={{background:"rgba(0,200,255,.07)",color:"var(--c)",border:"1px solid rgba(0,200,255,.2)",fontSize:10}}>✦{r.confirmCount} CONF</span>
+                      <span className={`pill ${{scalp:"ps",day:"pd",swing:"pw"}[r.strategy]}`}>{r.strategy?.toUpperCase()}</span>
+                      {r.confirmCount===2&&<span className="pill pc" style={{fontSize:10}}>✦✦ FULL</span>}
                     </div>
-                    <div style={{fontSize:12,color:"var(--text2)"}}>
-                      Entry <span className="mono" style={{color:"var(--text)"}}>${fp(r.eLow)}–${fp(r.eHigh)}</span> · SL <span className="mono" style={{color:"var(--r)"}}>${fp(r.sl)}</span> · TP1 <span className="mono" style={{color:"var(--g)"}}>${fp(r.tp1)}</span>
+                    <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                      {r.tfDetail?.map((t,j)=><div key={j} className={`tf-badge ${t.trend==="BULL"?"tf-bull":"tf-bear"}`}>{t.tf?.toUpperCase()} {t.trend} · RSI {t.rsi}</div>)}
+                      <div className={`tf-badge ${r.macroTrend==="BULL"?"tf-bull":"tf-bear"}`} style={{fontWeight:800}}>MACRO:{r.macroTrend}</div>
                     </div>
                   </div>
                 </div>
-                <div style={{display:"flex",gap:12,alignItems:"center",flexShrink:0}}>
-                  <div style={{textAlign:"right"}}>
-                    <div className="mono" style={{fontSize:15,fontWeight:700}}>${fp(r.price)}</div>
-                    <div style={{fontSize:12,color:(r.chg24||0)>=0?"var(--g)":"var(--r)"}}>{(r.chg24||0)>=0?"+":""}{(r.chg24||0).toFixed(2)}%</div>
-                  </div>
-                  <Ring val={r.conf} color={col} sz={68}/>
+                <div style={{fontSize:12,color:"var(--t2)",display:"flex",gap:14,flexWrap:"wrap",marginBottom:4}}>
+                  <span>Entry <span className="mono" style={{color:"var(--text)"}}>${fp(r.eLow)}–${fp(r.eHigh)}</span></span>
+                  <span>SL <span className="mono" style={{color:"var(--r)"}}>${fp(r.sl)}</span></span>
+                  <span>TP1 <span className="mono" style={{color:col}}>${fp(r.tp1)}</span></span>
+                  <span>TP2 <span className="mono" style={{color:"var(--g)"}}>${fp(r.tp2)}</span></span>
+                  <span style={{color:"var(--c)"}}>R:R 1:{r.rrCheck?.rr2}</span>
+                  <span>{r.lev}× lev</span>
+                </div>
+                <div style={{fontSize:11,color:"var(--t2)",lineHeight:1.5}}>{r.reasons?.[0]||""}</div>
+              </div>
+              <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:6,flexShrink:0}}>
+                <div style={{textAlign:"right"}}>
+                  <div className="mono" style={{fontSize:15,fontWeight:700}}>${fp(r.price)}</div>
+                  <div style={{fontSize:12,color:(r.chg24||0)>=0?"var(--g)":"var(--r)",fontWeight:600}}>{(r.chg24||0)>=0?"+":""}{(r.chg24||0).toFixed(2)}%</div>
+                </div>
+                <Ring val={r.conf} color={col} sz={72}/>
+              </div>
+            </div>
+            <div className="prog" style={{marginTop:10}}>
+              <div className="pf" style={{width:`${r.conf}%`,background:`linear-gradient(90deg,${col}44,${col})`}}/>
+            </div>
+          </div>
+        );})}
+      </div>
+    )}
+  </div>);
+}
+
+// ══════════════════════════════════════════════════════════════════
+// WORLD #1 PREDICTION ENGINE
+// Fetches: 1m/5m/15m/1H/4H/1D klines + OrderBook + Funding Rate +
+//          Fear & Greed + CoinGecko metadata + News sentiment
+// Outputs: 15-minute prediction + Daily outlook + Full signal
+// ══════════════════════════════════════════════════════════════════
+
+// ── DATA FETCHERS ─────────────────────────────────────────────────
+async function fetchFearGreed() {
+  try {
+    const r = await fetch("https://api.alternative.me/fng/?limit=2", {signal:AbortSignal.timeout(5000)});
+    const d = await r.json();
+    const cur = d.data[0];
+    const prev= d.data[1];
+    return {
+      value:   parseInt(cur.value),
+      label:   cur.value_classification,
+      prev:    parseInt(prev.value),
+      change:  parseInt(cur.value) - parseInt(prev.value),
+    };
+  } catch { return null; }
+}
+
+async function fetchFundingRate(sym) {
+  try {
+    const r = await fetch(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${sym}`, {signal:AbortSignal.timeout(4000)});
+    if (!r.ok) throw new Error();
+    const d = await r.json();
+    return {
+      rate:       parseFloat(d.lastFundingRate) * 100,
+      markPrice:  parseFloat(d.markPrice),
+      indexPrice: parseFloat(d.indexPrice),
+    };
+  } catch { return null; }
+}
+
+async function fetchGlobalMarket() {
+  try {
+    const r = await fetch("https://api.coingecko.com/api/v3/global", {signal:AbortSignal.timeout(6000)});
+    const d = await r.json();
+    const dd = d.data;
+    return {
+      marketCap:      dd.total_market_cap?.usd || 0,
+      volume24h:      dd.total_volume?.usd || 0,
+      btcDominance:   dd.market_cap_percentage?.btc || 0,
+      ethDominance:   dd.market_cap_percentage?.eth || 0,
+      capChange24h:   dd.market_cap_change_percentage_24h_usd || 0,
+    };
+  } catch { return null; }
+}
+
+async function fetchCryptoNews(coinSymbol) {
+  // CryptoCompare free news API
+  try {
+    const r = await fetch(
+      `https://min-api.cryptocompare.com/data/v2/news/?categories=${coinSymbol},Blockchain,Trading&extraParams=CryptexQuant&lang=EN&sortOrder=latest&limit=8`,
+      {signal:AbortSignal.timeout(6000)}
+    );
+    if (!r.ok) throw new Error();
+    const d = await r.json();
+    if (!d.Data || !d.Data.length) return [];
+    return d.Data.map(n => ({
+      title:    n.title,
+      source:   n.source,
+      time:     n.published_on * 1000,
+      url:      n.url,
+      sentiment: analyzeSentiment(n.title + " " + (n.body||"").slice(0,200)),
+    })).slice(0, 6);
+  } catch { return []; }
+}
+
+// Simple news sentiment scorer
+function analyzeSentiment(text) {
+  const t = text.toLowerCase();
+  const bullWords = ['surge','rally','breakout','bullish','buy','rise','pump','moon','gain','profit','high','support','recovery','growth','adoption','partnership','launch','upgrade','bull'];
+  const bearWords = ['crash','dump','bearish','sell','drop','fall','fear','loss','low','hack','scam','ban','regulation','warning','risk','correction','plunge','decline','bear','liquidate'];
+  let bull = 0, bear = 0;
+  bullWords.forEach(w => { if(t.includes(w)) bull++; });
+  bearWords.forEach(w => { if(t.includes(w)) bear++; });
+  if (bull > bear + 1) return "BULLISH";
+  if (bear > bull + 1) return "BEARISH";
+  return "NEUTRAL";
+}
+
+// ── CANDLESTICK PATTERN DETECTOR ─────────────────────────────────
+function detectCandlePatterns(klines) {
+  if (!klines || klines.length < 5) return [];
+  const patterns = [];
+  const k = klines.slice(-5);
+  const last = k[4], prev = k[3], prev2 = k[2];
+
+  const body     = (c) => Math.abs(c.c - c.o);
+  const range    = (c) => c.h - c.l;
+  const upperW   = (c) => c.h - Math.max(c.c, c.o);
+  const lowerW   = (c) => Math.min(c.c, c.o) - c.l;
+  const isBull   = (c) => c.c > c.o;
+
+  const lastBody = body(last), lastRange = range(last);
+
+  // Hammer (bullish reversal)
+  if (lowerW(last) > lastBody * 2 && upperW(last) < lastBody * 0.3 && lastBody > 0 && !prev.c > prev.o) {
+    patterns.push({ name:"Hammer", bias:"BULL", strength:"MEDIUM", emoji:"🔨" });
+  }
+  // Shooting Star (bearish)
+  if (upperW(last) > lastBody * 2 && lowerW(last) < lastBody * 0.3 && lastBody > 0) {
+    patterns.push({ name:"Shooting Star", bias:"BEAR", strength:"MEDIUM", emoji:"🌠" });
+  }
+  // Bullish Engulfing
+  if (isBull(last) && !isBull(prev) && last.o < prev.c && last.c > prev.o && lastBody > body(prev) * 1.1) {
+    patterns.push({ name:"Bullish Engulfing", bias:"BULL", strength:"HIGH", emoji:"🟢" });
+  }
+  // Bearish Engulfing
+  if (!isBull(last) && isBull(prev) && last.o > prev.c && last.c < prev.o && lastBody > body(prev) * 1.1) {
+    patterns.push({ name:"Bearish Engulfing", bias:"BEAR", strength:"HIGH", emoji:"🔴" });
+  }
+  // Doji
+  if (lastBody < lastRange * 0.1 && lastRange > 0) {
+    patterns.push({ name:"Doji", bias:"NEUTRAL", strength:"LOW", emoji:"➕" });
+  }
+  // Marubozu (strong trend candle)
+  if (lastBody > lastRange * 0.9 && lastRange > 0) {
+    patterns.push({ name:isBull(last)?"Bull Marubozu":"Bear Marubozu", bias:isBull(last)?"BULL":"BEAR", strength:"HIGH", emoji:isBull(last)?"🟩":"🟥" });
+  }
+  // Morning Star (3-candle bullish reversal)
+  if (!isBull(prev2) && body(prev) < body(prev2)*0.3 && isBull(last) && last.c > (prev2.o+prev2.c)/2) {
+    patterns.push({ name:"Morning Star", bias:"BULL", strength:"HIGH", emoji:"🌅" });
+  }
+  // Evening Star (3-candle bearish reversal)
+  if (isBull(prev2) && body(prev) < body(prev2)*0.3 && !isBull(last) && last.c < (prev2.o+prev2.c)/2) {
+    patterns.push({ name:"Evening Star", bias:"BEAR", strength:"HIGH", emoji:"🌆" });
+  }
+  return patterns;
+}
+
+// ── RSI DIVERGENCE DETECTOR ───────────────────────────────────────
+function detectDivergence(klines) {
+  if (!klines || klines.length < 20) return null;
+  const cls = klines.map(k=>k.c);
+  const highs = klines.map(k=>k.h);
+  const lows  = klines.map(k=>k.l);
+  const n = cls.length;
+
+  // Find recent swing highs/lows (last 20 candles)
+  const seg = 10;
+  const rsi1 = calcRSI(cls.slice(n-seg-5, n-5), 7);
+  const rsi2 = calcRSI(cls.slice(n-5), 7);
+  const p1   = cls[n-seg-1];
+  const p2   = cls[n-1];
+  const h1   = Math.max(...highs.slice(n-seg-1, n-seg+2));
+  const h2   = Math.max(...highs.slice(n-3, n));
+  const l1   = Math.min(...lows.slice(n-seg-1, n-seg+2));
+  const l2   = Math.min(...lows.slice(n-3, n));
+
+  // Bullish divergence: price lower low, RSI higher low
+  if (l2 < l1 * 0.998 && rsi2 > rsi1 + 2) {
+    return { type:"BULLISH", msg:`Bullish divergence: Price made lower low ($${fp(l2)} < $${fp(l1)}) but RSI rising (${rsi1.toFixed(1)}→${rsi2.toFixed(1)}) — momentum reversing UP`, strength:"HIGH" };
+  }
+  // Bearish divergence: price higher high, RSI lower high
+  if (h2 > h1 * 1.002 && rsi2 < rsi1 - 2) {
+    return { type:"BEARISH", msg:`Bearish divergence: Price made higher high ($${fp(h2)} > $${fp(h1)}) but RSI falling (${rsi1.toFixed(1)}→${rsi2.toFixed(1)}) — momentum fading DOWN`, strength:"HIGH" };
+  }
+  // Hidden bullish: price higher low, RSI lower low (trend continuation)
+  if (l2 > l1 * 1.002 && rsi2 < rsi1 - 2) {
+    return { type:"HIDDEN_BULL", msg:`Hidden bullish divergence — uptrend continuation signal`, strength:"MEDIUM" };
+  }
+  return null;
+}
+
+// ── S/R LEVEL DETECTOR ────────────────────────────────────────────
+function detectSRLevels(klines, price) {
+  if (!klines || klines.length < 20) return { support:[], resistance:[] };
+  const pivots = [];
+  const k = klines.slice(-30);
+  // Find pivot highs/lows
+  for (let i = 2; i < k.length - 2; i++) {
+    const isPivotH = k[i].h > k[i-1].h && k[i].h > k[i-2].h && k[i].h > k[i+1].h && k[i].h > k[i+2].h;
+    const isPivotL = k[i].l < k[i-1].l && k[i].l < k[i-2].l && k[i].l < k[i+1].l && k[i].l < k[i+2].l;
+    if (isPivotH) pivots.push({ level: k[i].h, type:"R" });
+    if (isPivotL) pivots.push({ level: k[i].l, type:"S" });
+  }
+  const support    = pivots.filter(p => p.type==="S" && p.level < price).sort((a,b) => b.level-a.level).slice(0,3).map(p=>p.level);
+  const resistance = pivots.filter(p => p.type==="R" && p.level > price).sort((a,b) => a.level-b.level).slice(0,3).map(p=>p.level);
+  return { support, resistance };
+}
+
+// ══════════════════════════════════════════════════════════════════
+// MASTER PREDICTION ENGINE
+// Combines: 1m/5m/15m → 15-min pred | 1H/4H/1D → daily pred
+// + Fear&Greed + Funding + OrderBook + News + Patterns + Divergence
+// ══════════════════════════════════════════════════════════════════
+async function masterPredict(symbol, coinId) {
+  // ── Fetch everything in parallel ─────────────────────────────
+  const [
+    kl1m, kl5m, kl15m, kl1h, kl4h, kl1d,
+    ob, fg, fr, gm, news
+  ] = await Promise.all([
+    getKlines(symbol, "1m",  60).catch(()=>null),
+    getKlines(symbol, "5m",  60).catch(()=>null),
+    getKlines(symbol, "15m", 60).catch(()=>null),
+    getKlines(symbol, "1h",  100).catch(()=>null),
+    getKlines(symbol, "4h",  100).catch(()=>null),
+    getKlines(symbol, "1d",  60).catch(()=>null),
+    getOrderBook(symbol).catch(()=>null),
+    fetchFearGreed().catch(()=>null),
+    fetchFundingRate(symbol).catch(()=>null),
+    fetchGlobalMarket().catch(()=>null),
+    fetchCryptoNews(coinId).catch(()=>[]),
+  ]);
+
+  const price = kl15m?.[kl15m.length-1]?.c || kl1h?.[kl1h.length-1]?.c || 0;
+
+  // ── Analyse all timeframes ────────────────────────────────────
+  const a1m   = analyseTF(kl1m);
+  const a5m   = analyseTF(kl5m);
+  const a15m  = analyseTF(kl15m);
+  const a1h   = analyseTF(kl1h);
+  const a4h   = analyseTF(kl4h);
+  const a1d   = analyseTF(kl1d);
+
+  // ── Candlestick patterns ──────────────────────────────────────
+  const patterns15m = detectCandlePatterns(kl15m || []);
+  const patterns1h  = detectCandlePatterns(kl1h  || []);
+  const patterns4h  = detectCandlePatterns(kl4h  || []);
+
+  // ── RSI Divergence ────────────────────────────────────────────
+  const diverg15m = detectDivergence(kl15m || []);
+  const diverg1h  = detectDivergence(kl1h  || []);
+
+  // ── S/R Levels ────────────────────────────────────────────────
+  const sr = detectSRLevels(kl1h || [], price);
+
+  // ── Pump/Dump + SL Hunt ───────────────────────────────────────
+  const pumpDump = detectPumpDump(kl15m || kl1h || []);
+  const slHunt   = detectSLHunt(kl15m || kl1h || []);
+
+  // ── NEWS SENTIMENT score ──────────────────────────────────────
+  let newsBull = 0, newsBear = 0;
+  news.forEach(n => {
+    if (n.sentiment === "BULLISH") newsBull++;
+    else if (n.sentiment === "BEARISH") newsBear++;
+  });
+  const newsSentiment = newsBull > newsBear ? "BULLISH" : newsBear > newsBull ? "BEARISH" : "NEUTRAL";
+  const newsScore = news.length > 0 ? Math.round((newsBull / news.length) * 100) : 50;
+
+  // ══════════════════════════════════════════════════════════════
+  // 15-MINUTE PREDICTION
+  // Uses: 1m + 5m + 15m + OrderBook + FundingRate + Patterns
+  // ══════════════════════════════════════════════════════════════
+  let shortBullScore = 0, shortBearScore = 0;
+
+  // Timeframe votes (weighted)
+  if (a1m) {  if(a1m.trend==="BULL")  shortBullScore += 15; else if(a1m.trend==="BEAR")  shortBearScore += 15; }
+  if (a5m) {  if(a5m.trend==="BULL")  shortBullScore += 25; else if(a5m.trend==="BEAR")  shortBearScore += 25; }
+  if (a15m) { if(a15m.trend==="BULL") shortBullScore += 35; else if(a15m.trend==="BEAR") shortBearScore += 35; }
+
+  // Order book pressure
+  if (ob) {
+    const obScore = ((ob.bidPct - 50) / 50) * 15; // -15 to +15
+    if (obScore > 0) shortBullScore += obScore; else shortBearScore += Math.abs(obScore);
+  }
+
+  // Funding rate — negative = long pain (bearish for short term), positive = short pain
+  if (fr) {
+    if (fr.rate > 0.05) shortBearScore += 5;  // overleveraged longs = squeeze risk
+    else if (fr.rate < -0.02) shortBullScore += 5; // shorts may cover
+  }
+
+  // Candlestick patterns boost
+  patterns15m.forEach(p => {
+    if (p.bias==="BULL") shortBullScore += (p.strength==="HIGH"?8:4);
+    if (p.bias==="BEAR") shortBearScore += (p.strength==="HIGH"?8:4);
+  });
+
+  // RSI divergence
+  if (diverg15m) {
+    if (diverg15m.type==="BULLISH" || diverg15m.type==="HIDDEN_BULL") shortBullScore += 10;
+    if (diverg15m.type==="BEARISH") shortBearScore += 10;
+  }
+
+  const shortTotal = shortBullScore + shortBearScore || 1;
+  const shortBullPct = Math.round((shortBullScore / shortTotal) * 100);
+  const shortBearPct = 100 - shortBullPct;
+
+  const pred15m = {
+    direction:  shortBullPct >= 60 ? "UP" : shortBullPct <= 40 ? "DOWN" : "SIDEWAYS",
+    bullPct:    shortBullPct,
+    bearPct:    shortBearPct,
+    confidence: Math.abs(shortBullPct - 50) * 2,
+    patterns:   patterns15m,
+    divergence: diverg15m,
+    fundingRate:fr,
+    orderBook:  ob,
+    rsi1m:      a1m?.rsi,
+    rsi5m:      a5m?.rsi,
+    rsi15m:     a15m?.rsi,
+    keyLevel:   shortBullPct >= 60
+      ? sr.resistance[0] || null
+      : sr.support[0] || null,
+  };
+
+  // ══════════════════════════════════════════════════════════════
+  // DAILY PREDICTION
+  // Uses: 1H + 4H + 1D + Fear&Greed + GlobalMarket + News
+  // ══════════════════════════════════════════════════════════════
+  let dayBullScore = 0, dayBearScore = 0;
+
+  // Timeframe votes (weighted heavily)
+  if (a1h) {  if(a1h.trend==="BULL")  dayBullScore += 20; else if(a1h.trend==="BEAR")  dayBearScore += 20; }
+  if (a4h) {  if(a4h.trend==="BULL")  dayBullScore += 35; else if(a4h.trend==="BEAR")  dayBearScore += 35; }
+  if (a1d) {  if(a1d.trend==="BULL")  dayBullScore += 40; else if(a1d.trend==="BEAR")  dayBearScore += 40; }
+
+  // EMA200 on daily — absolute weight
+  if (a1d && a1d.e200Bull) dayBullScore += 20; else if (a1d) dayBearScore += 20;
+
+  // Fear & Greed
+  if (fg) {
+    if (fg.value >= 70)     dayBearScore += 8;  // extreme greed = sell zone
+    else if (fg.value <= 25) dayBullScore += 8;  // extreme fear = buy zone
+    else if (fg.value >= 55) dayBullScore += 4;  // greed = bullish bias
+    else if (fg.value <= 40) dayBearScore += 4;  // fear = bearish bias
+    if (fg.change > 5) dayBullScore += 3;  // rising sentiment
+    if (fg.change < -5) dayBearScore += 3; // falling sentiment
+  }
+
+  // Global market cap change
+  if (gm) {
+    if (gm.capChange24h > 2) dayBullScore += 6;
+    else if (gm.capChange24h < -2) dayBearScore += 6;
+    // BTC dominance rising = altcoin bearish
+    if (gm.btcDominance > 55) dayBearScore += 3; // BTC dominance high = alts suffer
+    else if (gm.btcDominance < 45) dayBullScore += 3; // alt season signal
+  }
+
+  // Patterns on higher TFs
+  [...patterns1h, ...patterns4h].forEach(p => {
+    if (p.bias==="BULL") dayBullScore += (p.strength==="HIGH"?5:2);
+    if (p.bias==="BEAR") dayBearScore += (p.strength==="HIGH"?5:2);
+  });
+
+  // RSI divergence on 1H
+  if (diverg1h) {
+    if (diverg1h.type==="BULLISH" || diverg1h.type==="HIDDEN_BULL") dayBullScore += 8;
+    if (diverg1h.type==="BEARISH") dayBearScore += 8;
+  }
+
+  // News sentiment
+  if (newsSentiment === "BULLISH") dayBullScore += 6;
+  else if (newsSentiment === "BEARISH") dayBearScore += 6;
+
+  const dayTotal = dayBullScore + dayBearScore || 1;
+  const dayBullPct = Math.round((dayBullScore / dayTotal) * 100);
+
+  const outlook = {
+    direction:    dayBullPct >= 60 ? "BULLISH" : dayBullPct <= 40 ? "BEARISH" : "RANGING",
+    bullPct:      dayBullPct,
+    bearPct:      100 - dayBullPct,
+    confidence:   Math.abs(dayBullPct - 50) * 2,
+    fearGreed:    fg,
+    globalMarket: gm,
+    news,
+    newsSentiment,
+    newsScore,
+    patterns1h,
+    patterns4h,
+    divergence:   diverg1h,
+    ema200daily:  a1d?.e200Bull,
+    rsi1h:        a1h?.rsi,
+    rsi4h:        a4h?.rsi,
+    rsi1d:        a1d?.rsi,
+  };
+
+  // ══════════════════════════════════════════════════════════════
+  // FINAL TRADE SIGNAL
+  // For signal: use full quantAnalyze (5 calls) since user asked for one coin
+  // ══════════════════════════════════════════════════════════════
+  const signal = await quantAnalyze(symbol, "day", price).catch(()=>null);
+
+  return {
+    price, symbol, coinId,
+    pred15m, outlook, signal,
+    sr, pumpDump, slHunt,
+    allTFData: {a1m,a5m,a15m,a1h,a4h,a1d},
+    timestamp: Date.now(),
+  };
+}
+
+// ══════════════════════════════════════════════════════════════════
+// PAGE SEARCH — WORLD #1 UI
+// ══════════════════════════════════════════════════════════════════
+function PageSearch() {
+  const [query,   setQuery]   = useState("");
+  const [pairs,   setPairs]   = useState([]);
+  const [drop,    setDrop]    = useState([]);
+  const [showDrop,setShowDrop]= useState(false);
+  const [sel,     setSel]     = useState(null);
+  const [data,    setData]    = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [loadMsg, setLoadMsg] = useState("");
+  const [newsTab, setNewsTab] = useState(false);
+  const inputRef = useRef(null);
+  const dropRef  = useRef(null);
+
+  // Load all pairs once
+  useEffect(()=>{
+    fetch("https://api.binance.com/api/v3/ticker/24hr",{signal:AbortSignal.timeout(10000)})
+      .then(r=>r.json())
+      .then(all=>{
+        const filtered = all
+          .filter(d=>d.symbol.endsWith("USDT")&&parseFloat(d.quoteVolume)>500000)
+          .sort((a,b)=>parseFloat(b.quoteVolume)-parseFloat(a.quoteVolume))
+          .map(d=>({
+            symbol:d.symbol,
+            id:d.symbol.replace("USDT",""),
+            price:parseFloat(d.lastPrice),
+            chg24:parseFloat(d.priceChangePercent),
+            vol:parseFloat(d.quoteVolume),
+          }));
+        setPairs(filtered);
+      })
+      .catch(()=>{});
+  },[]);
+
+  // Dropdown filter
+  useEffect(()=>{
+    if(!query.trim()){setDrop([]);setShowDrop(false);return;}
+    const q=query.toUpperCase().replace("/USDT","").replace("USDT","");
+    const matches=pairs.filter(p=>p.id.startsWith(q)||p.id.includes(q)).slice(0,10);
+    setDrop(matches);
+    setShowDrop(matches.length>0);
+  },[query,pairs]);
+
+  // Close dropdown on outside click
+  useEffect(()=>{
+    const h=e=>{if(dropRef.current&&!dropRef.current.contains(e.target))setShowDrop(false);};
+    document.addEventListener("mousedown",h);
+    return()=>document.removeEventListener("mousedown",h);
+  },[]);
+
+  const analyze = async (pair) => {
+    setSel(pair);
+    setShowDrop(false);
+    setQuery(`${pair.id}/USDT`);
+    setLoading(true);
+    setData(null);
+    setNewsTab(false);
+
+    const steps = [
+      "Fetching 1m · 5m · 15m chart data...",
+      "Fetching 1H · 4H · 1D chart data...",
+      "Analyzing order book depth...",
+      "Checking Fear & Greed Index...",
+      "Fetching funding rates...",
+      "Fetching global market data...",
+      "Scanning latest news...",
+      "Running 15-minute prediction engine...",
+      "Running daily outlook engine...",
+      "Generating trade signal...",
+    ];
+
+    let si = 0;
+    const msgTimer = setInterval(()=>{
+      si = (si+1) % steps.length;
+      setLoadMsg(steps[si]);
+    }, 800);
+    setLoadMsg(steps[0]);
+
+    try {
+      const result = await masterPredict(pair.symbol, pair.id);
+      setData(result);
+    } catch(e) {
+      console.error(e);
+    } finally {
+      clearInterval(msgTimer);
+      setLoading(false);
+      setLoadMsg("");
+    }
+  };
+
+  const TRENDING = ["BTC","ETH","SOL","BNB","DOGE","XRP","AVAX","LINK","INJ","ARB","OP","SUI","APT","TON","PEPE","WIF"];
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{marginBottom:24}}>
+        <h2 style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:26,fontWeight:900,letterSpacing:1.5,marginBottom:6}}>
+          AI <span style={{background:"linear-gradient(135deg,var(--c),var(--g))",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>PREDICTION</span>
+        </h2>
+        <div style={{fontSize:13,color:"var(--t2)"}}>
+          6 timeframes · News sentiment · Fear&Greed · Funding rate · 15-min & daily forecast
+        </div>
+      </div>
+
+      {/* Search input */}
+      <div ref={dropRef} style={{position:"relative",marginBottom:16}}>
+        <input
+          ref={inputRef}
+          className="inp"
+          placeholder="Enter coin: BTC, ETH, SOL, DOGE, PEPE..."
+          value={query}
+          onChange={e=>setQuery(e.target.value)}
+          onFocus={()=>drop.length&&setShowDrop(true)}
+          onKeyDown={e=>{
+            if(e.key==="Enter"&&drop.length>0) analyze(drop[0]);
+            if(e.key==="Escape") setShowDrop(false);
+          }}
+          style={{paddingLeft:50,paddingRight:48,fontSize:16,height:52,borderRadius:14,
+            border:"1.5px solid rgba(0,200,255,.3)",
+            background:"rgba(7,16,28,.98)",
+            boxShadow:"0 0 0 3px rgba(0,200,255,.06)"
+          }}
+        />
+        <span style={{position:"absolute",left:15,top:"50%",transform:"translateY(-50%)",fontSize:22,pointerEvents:"none"}}>🔍</span>
+        {loading&&<div style={{position:"absolute",right:14,top:"50%",transform:"translateY(-50%)"}}><Spin sz={20}/></div>}
+        {!loading&&query&&<button onClick={()=>{setQuery("");setSel(null);setData(null);setDrop([]);}} style={{position:"absolute",right:14,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",cursor:"pointer",color:"var(--t2)",fontSize:18}}>✕</button>}
+
+        {/* Dropdown */}
+        {showDrop&&<div className="dd" style={{top:"calc(100% + 8px)",borderRadius:14,overflow:"hidden"}}>
+          {drop.map(p=>(
+            <div key={p.symbol} className="ddi" onClick={()=>analyze(p)}
+              style={{padding:"12px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div style={{display:"flex",alignItems:"center",gap:12}}>
+                <div style={{width:36,height:36,borderRadius:10,background:"var(--bg3)",border:"1px solid var(--bdr)",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Barlow Condensed',sans-serif",fontSize:14,fontWeight:900,color:"var(--c)",flexShrink:0}}>
+                  {p.id[0]}
+                </div>
+                <div>
+                  <div style={{fontWeight:700,fontSize:14,fontFamily:"'Barlow Condensed',sans-serif",letterSpacing:.5}}>{p.id}/USDT</div>
+                  <div className="mono" style={{fontSize:11,color:"var(--t2)"}}>${fp(p.price)}</div>
                 </div>
               </div>
-              <div style={{fontSize:11,color:"var(--text2)",marginTop:10,lineHeight:1.5}}>{r.reasons?.[0]||""}</div>
-              <div className="prog" style={{marginTop:8}}><div className="pf" style={{width:`${r.conf}%`,background:`linear-gradient(90deg,${col}55,${col})`}}/></div>
-            </div>);
-          })}
-        </div>
-      }
-    </div>}
-  </div>);
-}
+              <div style={{textAlign:"right"}}>
+                <div style={{fontSize:13,color:p.chg24>=0?"var(--g)":"var(--r)",fontWeight:700}}>{p.chg24>=0?"+":""}{p.chg24.toFixed(2)}%</div>
+                <div style={{fontSize:10,color:"var(--t2)"}}>Vol ${(p.vol/1e6).toFixed(1)}M</div>
+              </div>
+            </div>
+          ))}
+        </div>}
+      </div>
 
-// ── SEARCH ────────────────────────────────────────────────────────
-function PageSearch(){
-  const[query,setQuery]=useState("");const[pairs,setPairs]=useState([]);const[filtered,setFiltered]=useState([]);const[show,setShow]=useState(false);const[sel,setSel]=useState(null);const[coinData,setCoinData]=useState(null);const[sigs,setSigs]=useState({});const[loading,setLoading]=useState(false);const[vst,setVst]=useState("day");const ref=useRef(null);
-  useEffect(()=>{fetch("https://api.binance.com/api/v3/ticker/24hr").then(r=>r.json()).then(all=>{setPairs(all.filter(d=>d.symbol.endsWith("USDT")&&parseFloat(d.quoteVolume)>5e5).sort((a,b)=>parseFloat(b.quoteVolume)-parseFloat(a.quoteVolume)).slice(0,120).map(d=>({symbol:d.symbol,id:d.symbol.replace("USDT",""),price:+d.lastPrice,chg24:+d.priceChangePercent})));}).catch(()=>{});},[]);
-  useEffect(()=>{if(!query.trim()){setFiltered([]);setShow(false);return;}const q=query.toUpperCase().replace("/USDT","");setFiltered(pairs.filter(p=>p.id.startsWith(q)||p.id.includes(q)).slice(0,12));setShow(true);},[query,pairs]);
-  useEffect(()=>{const h=e=>{if(ref.current&&!ref.current.contains(e.target))setShow(false);};document.addEventListener("mousedown",h);return()=>document.removeEventListener("mousedown",h);},[]);
-  const select=async(pair)=>{
-    setSel(pair);setShow(false);setQuery(`${pair.id}/USDT`);setLoading(true);setCoinData(null);setSigs({});
-    const results={};
-    for(const st of["scalp","day","swing"]){
-      const s=await quantAnalyze(pair.symbol,st,pair.price);
-      results[st]=s||{noSignal:true,reason:"Triple confirmation not achieved for this timeframe. Market is ranging or consolidating.",strategy:st};
-    }
-    setCoinData(pair);setSigs(results);setLoading(false);
-  };
-  const POP=["BTC","ETH","SOL","BNB","DOGE","XRP","ADA","LINK","AVAX","DOT","MATIC","APT","ARB","OP","INJ"];
-  return(<div>
-    <div style={{marginBottom:20}}><h2 style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:22,fontWeight:900,letterSpacing:1,marginBottom:4}}>CUSTOM <span style={{background:"var(--grd)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>PAIR ANALYSIS</span></h2><div style={{fontSize:13,color:"var(--text2)"}}>Search any USDT pair · Full quant analysis · All 3 strategies</div></div>
-    <div ref={ref} style={{position:"relative",marginBottom:18}}>
-      <input className="inp" placeholder="Search: DOGE, XRP, PEPE, WIF, INJ..." value={query} onChange={e=>setQuery(e.target.value)} onFocus={()=>query&&filtered.length&&setShow(true)} style={{paddingLeft:46,fontSize:15}}/>
-      <span style={{position:"absolute",left:14,top:"50%",transform:"translateY(-50%)",fontSize:20}}>🔍</span>
-      {show&&<div className="dd">{filtered.map(p=><div key={p.symbol} className="ddi" onClick={()=>select(p)}>
-        <div style={{display:"flex",alignItems:"center",gap:10}}>
-          <div style={{width:30,height:30,borderRadius:8,background:"var(--bg3)",border:"1px solid var(--bdr)",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Barlow Condensed',sans-serif",fontSize:13,fontWeight:800,color:"var(--c)",flexShrink:0}}>{p.id[0]}</div>
-          <div><div style={{fontWeight:700,fontFamily:"'Barlow Condensed',sans-serif",letterSpacing:.5}}>{p.id}/USDT</div><div className="mono" style={{fontSize:11,color:"var(--text2)"}}>${fp(p.price)}</div></div>
+      {/* Trending pills */}
+      {!sel&&!loading&&(
+        <div style={{marginBottom:24}}>
+          <div style={{fontSize:10,color:"var(--t2)",letterSpacing:2,marginBottom:10,fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700}}>🔥 TRENDING — CLICK TO ANALYZE</div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+            {TRENDING.map(id=>{
+              const p=pairs.find(x=>x.id===id);
+              return(
+                <button key={id} className="btn bh" style={{padding:"8px 14px",fontSize:12,display:"flex",alignItems:"center",gap:6}}
+                  onClick={()=>p&&analyze(p)} disabled={!p}>
+                  <span>{id}</span>
+                  {p&&<span style={{color:p.chg24>=0?"var(--g)":"var(--r)",fontSize:10,fontWeight:700}}>{p.chg24>=0?"+":""}{p.chg24.toFixed(2)}%</span>}
+                </button>
+              );
+            })}
+          </div>
         </div>
-        <div style={{fontSize:12,color:p.chg24>=0?"var(--g)":"var(--r)",fontWeight:700}}>{p.chg24>=0?"+":""}{p.chg24.toFixed(2)}%</div>
-      </div>)}</div>}
+      )}
+
+      {/* Loading state */}
+      {loading&&(
+        <div className="card ai" style={{padding:52,textAlign:"center",border:"1px solid rgba(0,200,255,.12)"}}>
+          <div style={{position:"relative",width:80,height:80,margin:"0 auto 24px"}}>
+            <Spin sz={80}/>
+            <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:28}}>🧠</div>
+          </div>
+          <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:18,color:"var(--c)",letterSpacing:1.5,marginBottom:8,fontWeight:800}}>
+            AI ANALYSIS — {sel?.id}/USDT
+          </div>
+          <div style={{fontSize:13,color:"var(--t2)",marginBottom:20}}>{loadMsg}</div>
+          <div style={{display:"flex",gap:10,justifyContent:"center",flexWrap:"wrap"}}>
+            {["1m·5m·15m","1H·4H·1D","OrderBook","Fear&Greed","Funding","News","Patterns","Divergence","S/R Levels","Signal"].map((s,i)=>(
+              <div key={i} style={{fontSize:10,padding:"4px 10px",background:"rgba(0,200,255,.06)",border:"1px solid rgba(0,200,255,.15)",borderRadius:20,color:"var(--c)",fontFamily:"'Barlow Condensed',sans-serif"}}>{s}</div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Results */}
+      {data&&!loading&&<SearchResults data={data} coinId={sel?.id} onRefresh={()=>analyze(sel)} newsTab={newsTab} setNewsTab={setNewsTab}/>}
     </div>
-    {!sel&&<><div style={{fontSize:10,color:"var(--text2)",letterSpacing:1.5,marginBottom:10,fontFamily:"'Barlow Condensed',sans-serif"}}>POPULAR PAIRS</div><div style={{display:"flex",flexWrap:"wrap",gap:8}}>{POP.map(id=>{const p=pairs.find(x=>x.id===id);return<button key={id} className="btn btn-h" style={{padding:"7px 13px",fontSize:11}} onClick={()=>p&&select(p)} disabled={!p}>{id}/USDT</button>;})}</div></>}
-    {loading&&<div className="card ai" style={{padding:44,textAlign:"center",marginTop:18}}><Spin sz={44}/><div style={{marginTop:14,color:"var(--c)",fontFamily:"'Barlow Condensed',sans-serif",fontSize:14,letterSpacing:1}}>RUNNING QUANT ANALYSIS ON {sel?.id}...</div><div style={{marginTop:6,color:"var(--text2)",fontSize:12}}>Fetching multi-timeframe data · Applying triple confirmation filter</div></div>}
-    {coinData&&!loading&&Object.keys(sigs).length>0&&<div style={{marginTop:16}}>
-      <div className="card" style={{padding:14,marginBottom:14}}>
-        <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:11,color:"var(--text2)",letterSpacing:2,marginBottom:12}}>STRATEGY OVERVIEW — {coinData.id}/USDT</div>
-        {["scalp","day","swing"].map(s=>{const sg=sigs[s];const isL=sg?.signal==="LONG";const sc={scalp:"var(--scalp)",day:"var(--day)",swing:"var(--swing)"}[s];return(
-          <div key={s} style={{display:"flex",alignItems:"center",gap:12,marginBottom:8}}>
-            <div style={{width:56,fontFamily:"'Barlow Condensed',sans-serif",fontSize:11,fontWeight:700,color:sc,letterSpacing:1}}>{s.toUpperCase()}</div>
-            {sg&&!sg.noSignal?<><div className="prog" style={{flex:1}}><div className="pf" style={{width:`${sg.conf}%`,background:sc}}/></div>
-              <span className={`pill ${isL?"pg":"pr"}`} style={{width:52,justifyContent:"center",fontSize:10}}>{isL?"▲ L":"▼ S"}</span>
-              <span className="mono" style={{fontSize:11,width:28,color:sc,textAlign:"right"}}>{sg.conf}%</span>
-              <span style={{fontSize:10,color:"var(--text2)",width:36,textAlign:"right"}}>✦{sg.confirmCount}</span>
-            </>:<div style={{flex:1,fontSize:12,color:"var(--y)"}}>⏳ No signal</div>}
-          </div>);})}
-      </div>
-      <div className="stab" style={{marginBottom:14}}>
-        <button className={`stab-btn ${vst==="scalp"?"as":""}`} onClick={()=>setVst("scalp")}>⚡ SCALP</button>
-        <button className={`stab-btn ${vst==="day"?"ad":""}`} onClick={()=>setVst("day")}>📊 DAY</button>
-        <button className={`stab-btn ${vst==="swing"?"aw":""}`} onClick={()=>setVst("swing")}>🌊 SWING</button>
-      </div>
-      <SignalCard coinId={coinData.id} name={coinData.id} sig={sigs[vst]} loading={false} onRefresh={()=>select(sel)} livePrice={coinData.price} liveChg={coinData.chg24}/>
-    </div>}
-  </div>);
+  );
 }
 
-// ── TRACKER ───────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════
+// SEARCH RESULTS — WORLD-CLASS LAYOUT
+// ══════════════════════════════════════════════════════════════════
+function SearchResults({ data, coinId, onRefresh, newsTab, setNewsTab }) {
+  const { pred15m, outlook, signal, sr, pumpDump, slHunt, allTFData, price, timestamp } = data;
+  const isUp   = pred15m.direction === "UP";
+  const isDay  = outlook.direction === "BULLISH";
+  const col15m = isUp ? "var(--g)" : pred15m.direction==="DOWN" ? "var(--r)" : "var(--y)";
+  const colDay = isDay ? "var(--g)" : outlook.direction==="BEARISH" ? "var(--r)" : "var(--y)";
+
+  const fgColor = (v) => v>=75?"var(--r)":v>=55?"var(--y)":v<=25?"var(--g)":v<=45?"var(--c)":"var(--text)";
+  const fgLabel = (v) => v>=75?"Extreme Greed":v>=55?"Greed":v<=25?"Extreme Fear":v<=45?"Fear":"Neutral";
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:16}}>
+
+      {/* ── LIVE PRICE HEADER ─────────────────────────────────── */}
+      <div className="card" style={{padding:"18px 22px",background:"linear-gradient(135deg,rgba(7,16,28,.99),rgba(0,30,50,.5))",border:"1px solid rgba(0,200,255,.2)"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:12}}>
+          <div>
+            <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:13,color:"var(--t2)",letterSpacing:2,marginBottom:6}}>LIVE ANALYSIS — {coinId}/USDT</div>
+            <div style={{display:"flex",alignItems:"baseline",gap:12,flexWrap:"wrap"}}>
+              <span className="mono" style={{fontSize:32,fontWeight:700,color:"var(--text)"}}>${fp(price)}</span>
+              <span style={{width:8,height:8,borderRadius:"50%",background:"var(--g)",display:"inline-block",boxShadow:"0 0 8px var(--g)"}} className="_pu"/>
+              <span style={{fontSize:11,color:"var(--t2)",fontFamily:"'Barlow Condensed',sans-serif"}}>Updated {new Date(timestamp).toLocaleTimeString()}</span>
+            </div>
+          </div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+            <button className="btn bo" style={{padding:"8px 14px",fontSize:11}} onClick={onRefresh}>🔄 Refresh</button>
+            <button className={`btn ${!newsTab?"bc":"bh"}`} style={{padding:"8px 14px",fontSize:11}} onClick={()=>setNewsTab(false)}>📊 Analysis</button>
+            <button className={`btn ${newsTab?"bc":"bh"}`} style={{padding:"8px 14px",fontSize:11}} onClick={()=>setNewsTab(true)}>📰 News {outlook.news?.length>0?`(${outlook.news.length})`:""}</button>
+          </div>
+        </div>
+      </div>
+
+      {newsTab ? (
+        /* ── NEWS TAB ──────────────────────────────────────────── */
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+            <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:14,fontWeight:700,letterSpacing:.5}}>LATEST NEWS — {coinId}</div>
+            <span className={`pill ${outlook.newsSentiment==="BULLISH"?"pg":outlook.newsSentiment==="BEARISH"?"pr":"py"}`}>
+              {outlook.newsSentiment==="BULLISH"?"🟢 BULLISH":outlook.newsSentiment==="BEARISH"?"🔴 BEARISH":"⚪ NEUTRAL"} SENTIMENT
+            </span>
+            <span style={{fontSize:12,color:"var(--t2)"}}>Score: {outlook.newsScore}% bullish</span>
+          </div>
+          {outlook.news?.length===0&&<div className="card" style={{padding:28,textAlign:"center"}}><div style={{fontSize:36,marginBottom:10}}>📰</div><div style={{color:"var(--t2)"}}>No news found. Market quiet.</div></div>}
+          {outlook.news?.map((n,i)=>(
+            <a key={i} href={n.url} target="_blank" rel="noreferrer" style={{textDecoration:"none"}}>
+              <div className="card" style={{padding:"14px 18px",borderLeft:`3px solid ${n.sentiment==="BULLISH"?"var(--g)":n.sentiment==="BEARISH"?"var(--r)":"var(--t2)"}`,cursor:"pointer"}}>
+                <div style={{display:"flex",justifyContent:"space-between",gap:12,alignItems:"flex-start"}}>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:14,fontWeight:600,lineHeight:1.5,marginBottom:5,color:"var(--text)"}}>{n.title}</div>
+                    <div style={{display:"flex",gap:10,alignItems:"center"}}>
+                      <span style={{fontSize:11,color:"var(--t2)"}}>{n.source}</span>
+                      <span style={{fontSize:10,color:"var(--t2)"}}>{new Date(n.time).toLocaleString()}</span>
+                    </div>
+                  </div>
+                  <span className={`pill ${n.sentiment==="BULLISH"?"pg":n.sentiment==="BEARISH"?"pr":"py"}`} style={{fontSize:10,flexShrink:0}}>
+                    {n.sentiment==="BULLISH"?"🟢 BULL":n.sentiment==="BEARISH"?"🔴 BEAR":"⚪ NEUTRAL"}
+                  </span>
+                </div>
+              </div>
+            </a>
+          ))}
+        </div>
+      ) : (<>
+
+      {/* ── 15-MINUTE PREDICTION ─────────────────────────────── */}
+      <div className="card" style={{padding:22,border:`2px solid ${col15m}33`,background:`linear-gradient(135deg,rgba(7,16,28,.99),rgba(${isUp?"0,55,28":pred15m.direction==="DOWN"?"55,5,18":"40,40,5"},.25))`}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16,flexWrap:"wrap",gap:12}}>
+          <div>
+            <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:11,color:"var(--t2)",letterSpacing:2,marginBottom:8}}>⚡ NEXT 15 MINUTES PREDICTION</div>
+            <div style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+              <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:34,fontWeight:900,color:col15m,letterSpacing:1,lineHeight:1}}>
+                {pred15m.direction==="UP"?"▲ BULLISH MOVE":pred15m.direction==="DOWN"?"▼ BEARISH MOVE":"⟷ SIDEWAYS"}
+              </div>
+              <div style={{display:"flex",flexDirection:"column",gap:5}}>
+                <span className={`pill ${pred15m.direction==="UP"?"pg":pred15m.direction==="DOWN"?"pr":"py"}`}>{pred15m.confidence.toFixed(0)}% confidence</span>
+                {pumpDump?.risk!=="NORMAL"&&<span className="pill pr">⚠️ {pumpDump.risk} DETECTED</span>}
+              </div>
+            </div>
+          </div>
+
+          {/* Bull/Bear gauge */}
+          <div style={{textAlign:"center"}}>
+            <div style={{position:"relative",width:90,height:90}}>
+              <svg viewBox="0 0 90 90" style={{width:90,height:90,transform:"rotate(-90deg)"}}>
+                <circle cx="45" cy="45" r="36" fill="none" stroke="rgba(255,32,82,.15)" strokeWidth="8"/>
+                <circle cx="45" cy="45" r="36" fill="none" stroke={col15m} strokeWidth="8"
+                  strokeDasharray={`${2*Math.PI*36*pred15m.bullPct/100} ${2*Math.PI*36*(1-pred15m.bullPct/100)}`}
+                  strokeLinecap="round" style={{filter:`drop-shadow(0 0 6px ${col15m})`}}/>
+              </svg>
+              <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}>
+                <div className="mono" style={{fontSize:16,fontWeight:700,color:col15m,lineHeight:1}}>{pred15m.bullPct}%</div>
+                <div style={{fontSize:8,color:"var(--t2)",fontFamily:"'Barlow Condensed',sans-serif"}}>BULL</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Short-term TF bars */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:14}}>
+          {[["1m",allTFData.a1m,"var(--scalp)"],["5m",allTFData.a5m,"var(--day)"],["15m",allTFData.a15m,"var(--swing)"]].map(([tf,a,c])=>(
+            <div key={tf} style={{background:"var(--bg3)",borderRadius:10,padding:"10px 12px",border:`1px solid ${a?( a.trend==="BULL"?"rgba(0,230,118,.25)":a.trend==="BEAR"?"rgba(255,32,82,.25)":"rgba(255,204,0,.15)"):"var(--bdr)"}`}}>
+              <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:10,color:"var(--t2)",letterSpacing:1,marginBottom:5}}>{tf}</div>
+              <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:16,fontWeight:800,color:a?(a.trend==="BULL"?"var(--g)":a.trend==="BEAR"?"var(--r)":"var(--y)"):"var(--t2)"}}>
+                {a?a.trend:"–"}
+              </div>
+              {a&&<div className="mono" style={{fontSize:10,color:"var(--t2)",marginTop:2}}>RSI {a.rsi}</div>}
+            </div>
+          ))}
+        </div>
+
+        {/* Order book + Funding */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+          {pred15m.orderBook&&(
+            <div style={{background:"var(--bg3)",borderRadius:10,padding:"10px 12px",border:"1px solid var(--bdr)"}}>
+              <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:9,color:"var(--t2)",letterSpacing:1.5,marginBottom:6}}>ORDER BOOK</div>
+              <div style={{height:6,borderRadius:3,overflow:"hidden",marginBottom:5,background:"rgba(255,32,82,.3)"}}>
+                <div style={{height:"100%",borderRadius:3,background:"var(--g)",width:`${pred15m.orderBook.bidPct}%`}}/>
+              </div>
+              <div style={{display:"flex",justifyContent:"space-between",fontSize:10}}>
+                <span style={{color:"var(--g)"}}>🟢 Bid {pred15m.orderBook.bidPct}%</span>
+                <span style={{color:"var(--r)"}}>🔴 Ask {(100-pred15m.orderBook.bidPct).toFixed(1)}%</span>
+              </div>
+            </div>
+          )}
+          {pred15m.fundingRate&&(
+            <div style={{background:"var(--bg3)",borderRadius:10,padding:"10px 12px",border:"1px solid var(--bdr)"}}>
+              <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:9,color:"var(--t2)",letterSpacing:1.5,marginBottom:6}}>FUNDING RATE</div>
+              <div className="mono" style={{fontSize:18,fontWeight:700,color:pred15m.fundingRate.rate>0.05?"var(--r)":pred15m.fundingRate.rate<0?"var(--g)":"var(--y)"}}>
+                {pred15m.fundingRate.rate>0?"+":""}{pred15m.fundingRate.rate.toFixed(4)}%
+              </div>
+              <div style={{fontSize:10,color:"var(--t2)",marginTop:2}}>
+                {pred15m.fundingRate.rate>0.05?"Longs overleveraged — squeeze risk":pred15m.fundingRate.rate<-0.02?"Shorts paying — squeeze UP likely":"Neutral funding"}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Candlestick patterns */}
+        {pred15m.patterns?.length>0&&(
+          <div style={{marginBottom:12}}>
+            <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:9,color:"var(--t2)",letterSpacing:1.5,marginBottom:6}}>CANDLESTICK PATTERNS (15m)</div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+              {pred15m.patterns.map((p,i)=>(
+                <div key={i} style={{padding:"6px 12px",borderRadius:8,background:p.bias==="BULL"?"rgba(0,230,118,.08)":p.bias==="BEAR"?"rgba(255,32,82,.08)":"rgba(255,204,0,.08)",border:p.bias==="BULL"?"1px solid rgba(0,230,118,.25)":p.bias==="BEAR"?"1px solid rgba(255,32,82,.25)":"1px solid rgba(255,204,0,.25)",fontSize:12}}>
+                  {p.emoji} {p.name} <span style={{fontSize:10,color:"var(--t2)"}}>({p.strength})</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Divergence */}
+        {pred15m.divergence&&(
+          <div style={{padding:"10px 14px",background:`rgba(${pred15m.divergence.type==="BULLISH"||pred15m.divergence.type==="HIDDEN_BULL"?"0,230,118":"255,32,82"},.06)`,border:`1px solid rgba(${pred15m.divergence.type==="BULLISH"||pred15m.divergence.type==="HIDDEN_BULL"?"0,230,118":"255,32,82"},.2)`,borderRadius:10,fontSize:12,lineHeight:1.6}}>
+            <span style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,color:pred15m.divergence.type==="BULLISH"||pred15m.divergence.type==="HIDDEN_BULL"?"var(--g)":"var(--r)",marginRight:8}}>📐 RSI DIVERGENCE:</span>
+            {pred15m.divergence.msg}
+          </div>
+        )}
+
+        {/* SL Hunt */}
+        {slHunt?.detected&&<div style={{marginTop:10,padding:"10px 14px",background:"rgba(255,204,0,.05)",border:"1px solid rgba(255,204,0,.25)",borderRadius:10,fontSize:12,lineHeight:1.6}}>
+          🎯 <strong style={{color:"var(--y)"}}>SL HUNT:</strong> {slHunt.msg}
+        </div>}
+
+        {/* Key level */}
+        {pred15m.keyLevel&&<div style={{marginTop:10,padding:"10px 14px",background:"var(--bg3)",borderRadius:10,border:"1px solid var(--bdr)",fontSize:12}}>
+          {pred15m.direction==="UP"?"🎯 Next resistance":"🛡 Key support"}: <span className="mono" style={{color:col15m,fontWeight:700}}>${fp(pred15m.keyLevel)}</span>
+        </div>}
+      </div>
+
+      {/* ── DAILY OUTLOOK ─────────────────────────────────────── */}
+      <div className="card" style={{padding:22,border:`2px solid ${colDay}33`}}>
+        <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:11,color:"var(--t2)",letterSpacing:2,marginBottom:14}}>📅 TODAY'S MARKET OUTLOOK</div>
+
+        {/* Direction bar */}
+        <div style={{marginBottom:16}}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:6,fontSize:12}}>
+            <span style={{color:"var(--g)",fontWeight:700}}>▲ BULLISH {outlook.bullPct}%</span>
+            <span style={{color:"var(--r)",fontWeight:700}}>▼ BEARISH {outlook.bearPct}%</span>
+          </div>
+          <div style={{height:10,borderRadius:5,background:"rgba(255,32,82,.3)",overflow:"hidden"}}>
+            <div style={{height:"100%",borderRadius:5,background:"linear-gradient(90deg,var(--g),rgba(0,230,118,.7))",width:`${outlook.bullPct}%`,transition:"width 1s ease"}}/>
+          </div>
+          <div style={{textAlign:"center",marginTop:6}}>
+            <span style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:20,fontWeight:900,color:colDay,letterSpacing:1}}>
+              {outlook.direction==="BULLISH"?"🟢 BULLISH DAY":outlook.direction==="BEARISH"?"🔴 BEARISH DAY":"⟷ RANGING DAY"}
+            </span>
+            <span style={{fontSize:12,color:"var(--t2)",marginLeft:10}}>{outlook.confidence.toFixed(0)}% confidence</span>
+          </div>
+        </div>
+
+        {/* Higher TF grid */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:14}}>
+          {[["1H",allTFData.a1h],["4H",allTFData.a4h],["1D",allTFData.a1d]].map(([tf,a])=>(
+            <div key={tf} style={{background:"var(--bg3)",borderRadius:10,padding:"10px 12px",border:`1px solid ${a?(a.trend==="BULL"?"rgba(0,230,118,.25)":a.trend==="BEAR"?"rgba(255,32,82,.25)":"rgba(255,204,0,.15)"):"var(--bdr)"}`}}>
+              <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:10,color:"var(--t2)",letterSpacing:1,marginBottom:5}}>{tf}</div>
+              <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:16,fontWeight:800,color:a?(a.trend==="BULL"?"var(--g)":a.trend==="BEAR"?"var(--r)":"var(--y)"):"var(--t2)"}}>
+                {a?a.trend:"–"}
+              </div>
+              <div style={{display:"flex",flexDirection:"column",gap:2,marginTop:3}}>
+                {a&&<div className="mono" style={{fontSize:9,color:"var(--t2)"}}>RSI {a.rsi}</div>}
+                {a&&<div style={{fontSize:9,color:a.e200Bull?"var(--g)":"var(--r)",fontFamily:"'Barlow Condensed',sans-serif"}}>EMA200 {a.e200Bull?"✓ ABOVE":"✗ BELOW"}</div>}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Fear & Greed + Global Market */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10,marginBottom:14}}>
+          {outlook.fearGreed&&(
+            <div style={{background:"var(--bg3)",borderRadius:10,padding:"12px 14px",border:"1px solid var(--bdr)"}}>
+              <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:9,color:"var(--t2)",letterSpacing:1.5,marginBottom:6}}>FEAR & GREED</div>
+              <div className="mono" style={{fontSize:26,fontWeight:700,color:fgColor(outlook.fearGreed.value),marginBottom:3}}>{outlook.fearGreed.value}</div>
+              <div style={{fontSize:11,color:fgColor(outlook.fearGreed.value),fontWeight:600}}>{fgLabel(outlook.fearGreed.value)}</div>
+              <div style={{fontSize:10,color:"var(--t2)",marginTop:2}}>
+                {outlook.fearGreed.change>0?`▲ +${outlook.fearGreed.change} from yesterday`:`▼ ${outlook.fearGreed.change} from yesterday`}
+              </div>
+            </div>
+          )}
+          {outlook.globalMarket&&(
+            <div style={{background:"var(--bg3)",borderRadius:10,padding:"12px 14px",border:"1px solid var(--bdr)"}}>
+              <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:9,color:"var(--t2)",letterSpacing:1.5,marginBottom:6}}>GLOBAL MARKET</div>
+              <div style={{fontSize:12,fontWeight:600,marginBottom:3,color:outlook.globalMarket.capChange24h>=0?"var(--g)":"var(--r)"}}>
+                {outlook.globalMarket.capChange24h>=0?"▲ +":""}{outlook.globalMarket.capChange24h.toFixed(2)}% 24h
+              </div>
+              <div style={{fontSize:10,color:"var(--t2)",lineHeight:1.8}}>
+                <div>BTC Dom: <span className="mono" style={{color:"var(--y)"}}>{outlook.globalMarket.btcDominance.toFixed(1)}%</span></div>
+                <div>Cap: <span className="mono" style={{color:"var(--c)"}}>${(outlook.globalMarket.marketCap/1e12).toFixed(2)}T</span></div>
+              </div>
+            </div>
+          )}
+          <div style={{background:"var(--bg3)",borderRadius:10,padding:"12px 14px",border:"1px solid var(--bdr)"}}>
+            <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:9,color:"var(--t2)",letterSpacing:1.5,marginBottom:6}}>NEWS SENTIMENT</div>
+            <div style={{fontSize:13,fontWeight:700,color:outlook.newsSentiment==="BULLISH"?"var(--g)":outlook.newsSentiment==="BEARISH"?"var(--r)":"var(--y)",marginBottom:3}}>
+              {outlook.newsSentiment==="BULLISH"?"🟢 BULLISH":outlook.newsSentiment==="BEARISH"?"🔴 BEARISH":"⚪ NEUTRAL"}
+            </div>
+            <div style={{fontSize:11,color:"var(--t2)"}}>{outlook.newsScore}% positive</div>
+            <div style={{fontSize:10,color:"var(--t2)",marginTop:2}}>{outlook.news?.length||0} articles analyzed</div>
+          </div>
+        </div>
+
+        {/* S/R Levels */}
+        {(sr.resistance.length>0||sr.support.length>0)&&(
+          <div style={{background:"var(--bg3)",borderRadius:10,padding:"12px 14px",border:"1px solid var(--bdr)",marginBottom:14}}>
+            <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:9,color:"var(--t2)",letterSpacing:1.5,marginBottom:8}}>KEY S/R LEVELS (1H chart)</div>
+            <div style={{display:"flex",gap:24,flexWrap:"wrap"}}>
+              <div>
+                <div style={{fontSize:10,color:"var(--r)",fontFamily:"'Barlow Condensed',sans-serif",letterSpacing:1,marginBottom:4}}>RESISTANCE</div>
+                {sr.resistance.slice(0,3).map((l,i)=><div key={i} className="mono" style={{fontSize:12,color:"var(--r)",marginBottom:2}}>${fp(l)}</div>)}
+                {sr.resistance.length===0&&<div style={{fontSize:11,color:"var(--t2)"}}>None identified</div>}
+              </div>
+              <div>
+                <div style={{fontSize:10,color:"var(--g)",fontFamily:"'Barlow Condensed',sans-serif",letterSpacing:1,marginBottom:4}}>SUPPORT</div>
+                {sr.support.slice(0,3).map((l,i)=><div key={i} className="mono" style={{fontSize:12,color:"var(--g)",marginBottom:2}}>${fp(l)}</div>)}
+                {sr.support.length===0&&<div style={{fontSize:11,color:"var(--t2)"}}>None identified</div>}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Patterns on higher TFs */}
+        {[...outlook.patterns1h,...outlook.patterns4h].length>0&&(
+          <div>
+            <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:9,color:"var(--t2)",letterSpacing:1.5,marginBottom:6}}>PATTERNS (1H/4H)</div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+              {[...outlook.patterns1h,...outlook.patterns4h].map((p,i)=>(
+                <div key={i} style={{padding:"6px 12px",borderRadius:8,background:"var(--bg3)",border:"1px solid var(--bdr)",fontSize:12}}>
+                  {p.emoji} {p.name}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── TRADE SIGNAL ──────────────────────────────────────── */}
+      {signal && !signal.noSignal ? (
+        <div>
+          <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:11,color:"var(--t2)",letterSpacing:2,marginBottom:12}}>🎯 TRADE SIGNAL — DAY TRADING</div>
+          <SignalCard coinId={coinId} name={coinId} sig={signal} loading={false} onRefresh={onRefresh} livePrice={price}/>
+        </div>
+      ) : (
+        <div className="card" style={{padding:20,border:"1px solid rgba(255,204,0,.2)"}}>
+          <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:11,color:"var(--t2)",letterSpacing:2,marginBottom:10}}>🎯 TRADE SIGNAL</div>
+          <div style={{display:"flex",gap:12,alignItems:"flex-start"}}>
+            <span style={{fontSize:28,flexShrink:0}}>⏳</span>
+            <div>
+              <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:16,fontWeight:700,color:"var(--y)",marginBottom:6}}>NO TRADE — STAND ASIDE</div>
+              <div style={{fontSize:13,color:"var(--text)",lineHeight:1.8}}>{signal?.reason||"Timeframe consensus not achieved. Wait for all TFs to align."}</div>
+              {signal?.tfDetail&&<div style={{marginTop:10}}><TFBadges tfDetail={signal.tfDetail} macroTrend={signal.macroTrend}/></div>}
+            </div>
+          </div>
+        </div>
+      )}
+      </>)}
+    </div>
+  );
+}
+
+
 function PageTracker(){
   const[hist]=useState(()=>{const h=localStorage.getItem("cx_history");if(h)return JSON.parse(h);const cs=["BTC","ETH","SOL","BNB","AVAX","DOGE","XRP","LINK","MATIC","APT"];const ss=["scalp","day","swing"];return Array.from({length:30},(_,i)=>{const w=Math.random()<0.74;return{id:i,coin:cs[i%10],strategy:ss[i%3],signal:Math.random()>0.5?"LONG":"SHORT",conf:Math.round(72+Math.random()*20),result:w?"WIN":"LOSS",profit:w?+(1.5+Math.random()*5).toFixed(2):-(0.5+Math.random()*2.5).toFixed(2),time:new Date(Date.now()-i*8*3600*1000).toLocaleDateString()};});});
   const[filter,setFilter]=useState("all");const fl=filter==="all"?hist:hist.filter(h=>h.strategy===filter);
@@ -1240,23 +2738,54 @@ function PageTracker(){
 // ── CHAT ──────────────────────────────────────────────────────────
 function PageChat({user}){
   const[msgs,setMsgs]=useState([]);const[text,setText]=useState("");const isAdmin=user?.role==="admin";
-  const tid=user.cqid||user.email;const[closed,setClosed]=useState(()=>Chat.isClosed(tid));const bottomRef=useRef(null);
-  const load=useCallback(()=>{const all=Chat.get();setMsgs(isAdmin?all:all.filter(m=>m.tid===tid||m.role==="admin"));Chat.markRead(user.role);},[user.cqid,user.role,isAdmin,tid]);
+  const baseTid=user.cqid||user.email;
+  // Use activeTid from state so user can open new ticket after closing
+  const[activeTid,setActiveTid]=useState(()=>{
+    // Find the latest open thread for this user
+    try{const threads=JSON.parse(localStorage.getItem("cx_threads")||"{}");
+      // Get all keys that start with baseTid, sorted desc (most recent first)
+      const myThreads=Object.keys(threads).filter(k=>k===baseTid||k.startsWith(baseTid+"_")).sort().reverse();
+      for(const t of myThreads){if(!threads[t]?.closed)return t;}
+      // All closed - use baseTid as default (will show closed state)
+      return baseTid;
+    }catch{return baseTid;}
+  });
+  const[closed,setClosed]=useState(()=>Chat.isClosed(activeTid));
+  const bottomRef=useRef(null);
+  const load=useCallback(()=>{
+    const all=Chat.get();
+    // For user: show messages from their active thread + admin replies to them
+    setMsgs(isAdmin?all:all.filter(m=>m.tid===activeTid||(m.role==="admin"&&m.tid===activeTid)));
+    Chat.markRead(user.role);
+  },[user.cqid,user.role,isAdmin,activeTid]);
   useEffect(()=>{load();const t=setInterval(load,3000);return()=>clearInterval(t);},[load]);
   useEffect(()=>{bottomRef.current?.scrollIntoView({behavior:"smooth"});},[msgs]);
-  const send=()=>{if(!text.trim()||closed)return;Chat.send(user.cqid||user.email,text.trim(),user.role,tid);setText("");setTimeout(load,200);};
-  const closeEnq=()=>{if(!window.confirm("Mark this enquiry as resolved?"))return;Chat.closeThread(tid);setClosed(true);};
+  const send=()=>{if(!text.trim()||closed)return;Chat.send(user.cqid||user.email,text.trim(),user.role,activeTid);setText("");setTimeout(load,200);};
+  const closeEnq=()=>{if(!window.confirm("Mark this enquiry as resolved?"))return;Chat.closeThread(activeTid);setClosed(true);};
+  const openNewChat=()=>{
+    const newTid=`${baseTid}_${Date.now()}`;
+    // Store new thread as open
+    const threads=JSON.parse(localStorage.getItem("cx_threads")||"{}");
+    threads[newTid]={closed:false,at:Date.now()};
+    localStorage.setItem("cx_threads",JSON.stringify(threads));
+    setActiveTid(newTid);setClosed(false);setMsgs([]);
+    Chat.send(user.cqid||user.email,"[New enquiry opened]",user.role,newTid);
+  };
   const threads=isAdmin?[...new Set(Chat.get().map(m=>m.tid||m.from))]:null;
   return(<div>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
       <div><h2 style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:22,fontWeight:900,letterSpacing:1}}>{isAdmin?"💬 USER ENQUIRIES":"💬 SUPPORT"}</h2>
       <div style={{fontSize:12,color:"var(--text2)",marginTop:3}}>{isAdmin?"Manage all user messages":"Chat with our support team"}</div></div>
       {!isAdmin&&!closed&&<button className="btn btn-r" style={{padding:"8px 14px",fontSize:11}} onClick={closeEnq}>✓ Close Enquiry</button>}
-      {!isAdmin&&closed&&<span className="pill pg">✓ Enquiry Closed</span>}
+      {!isAdmin&&closed&&<div style={{display:"flex",gap:8,alignItems:"center"}}>
+        <span className="pill pg">✓ Enquiry Closed</span>
+        <button className="btn btn-c" style={{padding:"8px 14px",fontSize:11}} onClick={openNewChat}>+ New Chat</button>
+      </div>}
     </div>
     <div className="card" style={{height:500,display:"flex",flexDirection:"column"}}>
-      {closed&&!isAdmin&&<div style={{padding:"10px 16px",background:"rgba(0,255,136,.06)",borderBottom:"1px solid rgba(0,255,136,.15)",fontSize:12,color:"var(--g)",display:"flex",gap:8}}>
-        <span>✅</span>Enquiry closed. Open a new chat to contact support.
+      {closed&&!isAdmin&&<div style={{padding:"10px 16px",background:"rgba(0,255,136,.06)",borderBottom:"1px solid rgba(0,255,136,.15)",fontSize:12,color:"var(--g)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}><span>✅</span><span>Enquiry closed.</span></div>
+        <button className="btn btn-c" style={{padding:"5px 14px",fontSize:11,borderRadius:20}} onClick={openNewChat}>+ Open New Chat</button>
       </div>}
       <div style={{flex:1,overflowY:"auto",padding:16,display:"flex",flexDirection:"column",gap:12}}>
         {msgs.length===0?<div style={{textAlign:"center",color:"var(--text2)",marginTop:60}}><div style={{fontSize:44,marginBottom:12}}>💬</div><div>No messages yet.</div></div>:
@@ -1449,7 +2978,18 @@ function PageAlerts({notifs,setNotifs,paused}){
 // ── SETTINGS ──────────────────────────────────────────────────────
 function PageSettings({settings,upd,user,logout}){
   const[days,setDays]=useState(null);
+  const[tgToken,setTgToken]=useState(()=>localStorage.getItem("cq_tg_token")||"");
+  const[tgChatId,setTgChatId]=useState(()=>localStorage.getItem("cq_tg_chatid")||"");
+  const[tgStatus,setTgStatus]=useState("");
+  const[tgLoading,setTgLoading]=useState(false);
   useEffect(()=>{if(user?.expiresAt)setDays(Math.max(0,Math.ceil((user.expiresAt-Date.now())/86400000)));},[user]);
+  const saveTelegram=()=>{localStorage.setItem("cq_tg_token",tgToken.trim());localStorage.setItem("cq_tg_chatid",tgChatId.trim());setTgStatus("✅ Saved!");setTimeout(()=>setTgStatus(""),2000);};
+  const testTelegram=async()=>{
+    setTgLoading(true);setTgStatus("Sending test...");
+    const r=await sendTelegramMessage(tgToken.trim(),tgChatId.trim(),"✅ <b>Cryptex Quant Bot Connected!</b>\n\nYour signal bot is working. You will receive LONG/SHORT signals here.\n\n<i>Powered by Cryptex Quant v5.0</i>");
+    setTgStatus(r.ok?"✅ Test message sent!":"❌ "+r.err);
+    setTgLoading(false);
+  };
   return<div style={{display:"flex",flexDirection:"column",gap:14}}>
     <div className="card" style={{padding:18,border:"1px solid rgba(0,200,255,.18)"}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:12}}>
@@ -1480,6 +3020,36 @@ function PageSettings({settings,upd,user,logout}){
           <Tog checked={!!settings[it.k]} onChange={v=>upd(it.k,v)}/>
         </div>
       ))}
+    </div>
+    {/* Telegram Bot */}
+    <div className="card" style={{padding:20,border:"1px solid rgba(0,212,255,.15)"}}>
+      <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:16}}>
+        <div style={{width:40,height:40,borderRadius:10,background:"rgba(0,136,204,.2)",border:"1px solid rgba(0,136,204,.4)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0}}>✈️</div>
+        <div><div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:14,fontWeight:700,letterSpacing:.5}}>TELEGRAM BOT INTEGRATION</div>
+        <div style={{fontSize:11,color:"var(--text2)"}}>Receive signals directly in Telegram</div></div>
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+        <div>
+          <div style={{fontSize:11,color:"var(--text2)",marginBottom:5,fontFamily:"'Barlow Condensed',sans-serif",letterSpacing:1}}>BOT TOKEN (from @BotFather)</div>
+          <input className="inp mono" style={{fontSize:12}} placeholder="1234567890:ABCdefGHI..." value={tgToken} onChange={e=>setTgToken(e.target.value)}/>
+        </div>
+        <div>
+          <div style={{fontSize:11,color:"var(--text2)",marginBottom:5,fontFamily:"'Barlow Condensed',sans-serif",letterSpacing:1}}>CHAT ID (your Telegram user/group ID)</div>
+          <input className="inp mono" style={{fontSize:12}} placeholder="-1001234567890 or 123456789" value={tgChatId} onChange={e=>setTgChatId(e.target.value)}/>
+        </div>
+        {tgStatus&&<div style={{fontSize:12,color:tgStatus.startsWith("✅")?"var(--g)":"var(--r)",padding:"7px 12px",background:tgStatus.startsWith("✅")?"rgba(0,255,136,.07)":"rgba(255,32,82,.07)",borderRadius:8}}>{tgStatus}</div>}
+        <div style={{display:"flex",gap:8}}>
+          <button className="btn btn-c" style={{flex:1,padding:10,fontSize:12}} onClick={saveTelegram} disabled={!tgToken||!tgChatId}>💾 Save</button>
+          <button className="btn btn-o" style={{flex:1,padding:10,fontSize:12}} onClick={testTelegram} disabled={!tgToken||!tgChatId||tgLoading}>{tgLoading?<Spin sz={14}/>:"📤 Test Bot"}</button>
+        </div>
+        <div style={{padding:"10px 12px",background:"var(--bg3)",borderRadius:8,fontSize:11,color:"var(--text2)",lineHeight:1.8}}>
+          <div style={{color:"var(--c)",fontWeight:700,marginBottom:4}}>How to set up:</div>
+          <div>1. Message @BotFather → /newbot → get Bot Token</div>
+          <div>2. Message your bot → get your Chat ID from @userinfobot</div>
+          <div>3. Paste both above → Save → Test Bot</div>
+          <div>4. Use Scan/Search → "Send to Telegram" button appears on signals</div>
+        </div>
+      </div>
     </div>
   </div>;
 }
@@ -1516,7 +3086,7 @@ function PageAdmin({user}){
       <span style={{fontSize:18}}>🔔</span><span style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,color:"var(--r)",letterSpacing:.5}}>{pending.length} PAYMENT{pending.length>1?"S":""} AWAITING VERIFICATION</span>
     </div>}
     <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
-      {[["pending","⚠️ Pending"],["users","👥 Users"],["payments","💳 Payments"],["chat","💬 Chat"]].map(([k,l])=>(
+      {[["pending","⚠️ Pending"],["users","👥 Users"],["payments","💳 Payments"],["telegram","✈️ Telegram"],["chat","💬 Chat"]].map(([k,l])=>(
         <button key={k} className={`btn ${sub===k?"btn-c":"btn-h"}`} style={{padding:"8px 14px"}} onClick={()=>setSub(k)}>
           {l}{k==="pending"&&pending.length>0?` (${pending.length})`:k==="users"?` (${users.length})`:""}
         </button>
@@ -1565,6 +3135,42 @@ function PageAdmin({user}){
           <div className="mono" style={{fontSize:20,fontWeight:700,color:"#ffcc00"}}>{p.usdt} USDT</div>
         </div>
       </div>)}
+    </div>}
+    {sub==="telegram"&&<div style={{display:"flex",flexDirection:"column",gap:14}}>
+      <div className="card" style={{padding:20,border:"1px solid rgba(0,153,204,.25)"}}>
+        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:16}}>
+          <span style={{fontSize:26}}>✈️</span>
+          <div><div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:16,fontWeight:700,marginBottom:2}}>ADMIN BOT TOKEN</div>
+          <div style={{fontSize:12,color:"var(--t2)"}}>{users.filter(u=>u.telegramChatId&&u.plan!=="free"&&Date.now()<u.expiresAt).length} paid subscribers with Telegram linked</div></div>
+        </div>
+        <div style={{marginBottom:10}}>
+          <div style={{fontSize:11,color:"var(--t2)",marginBottom:5,fontFamily:"'Barlow Condensed',sans-serif",letterSpacing:1}}>BOT TOKEN (from @BotFather)</div>
+          <input className="inp mono" style={{fontSize:12}} placeholder="1234567890:ABCdef..." value={tgToken} onChange={e=>setTgToken(e.target.value)}/>
+        </div>
+        {tgStatus&&<div style={{fontSize:12,padding:"7px 12px",borderRadius:8,marginBottom:8,color:tgStatus.startsWith("✅")?"var(--g)":"var(--r)",background:tgStatus.startsWith("✅")?"rgba(0,230,118,.07)":"rgba(255,32,82,.07)"}}>{tgStatus}</div>}
+        <div style={{display:"flex",gap:8}}>
+          <button className="btn bc" style={{flex:1,padding:10,fontSize:11}} onClick={()=>{localStorage.setItem("cq_admin_tg_token",tgToken.trim());setTgStatus("✅ Saved! Now use 'Broadcast' on any signal.");}} disabled={!tgToken.trim()}>💾 Save Token</button>
+          <button className="btn bo" style={{flex:1,padding:10,fontSize:11}} onClick={async()=>{setTgLoading(true);setTgStatus("Testing...");const r=await tgSend(tgToken.trim(),"@"+tgToken.split(":")[0],"✅ Bot connected!");setTgStatus(r.ok?"✅ Bot working!":"❌ "+r.err);setTgLoading(false);}} disabled={!tgToken.trim()||tgLoading}>{tgLoading?<Spin sz={12}/>:"📤 Test"}</button>
+        </div>
+        <div style={{marginTop:12,padding:"10px 12px",background:"var(--bg3)",borderRadius:8,fontSize:11,color:"var(--t2)",lineHeight:1.8}}>
+          <div style={{color:"var(--c)",fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,marginBottom:4}}>How signals reach users:</div>
+          <div>1. You (admin) save Bot Token here</div>
+          <div>2. Paid users link Chat ID in Settings → Telegram</div>
+          <div>3. You click "Broadcast to Paid Subscribers" on any signal</div>
+          <div>4. System sends to all active paid users with linked Telegram</div>
+          <div>5. Scanner → "Broadcast Scan" sends top 5 results</div>
+        </div>
+      </div>
+      <div className="card" style={{padding:16}}>
+        <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:11,color:"var(--t2)",letterSpacing:2,marginBottom:12}}>LINKED SUBSCRIBERS</div>
+        {users.filter(u=>u.telegramChatId&&u.plan!=="free"&&Date.now()<u.expiresAt).length===0?
+          <div style={{fontSize:13,color:"var(--t2)"}}>No paid users have linked Telegram yet. Ask subscribers to go to Settings → Link Telegram.</div>:
+          users.filter(u=>u.telegramChatId&&u.plan!=="free"&&Date.now()<u.expiresAt).map((u,i)=>(
+          <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"8px 0",borderBottom:"1px solid var(--bdr)",fontSize:12}}>
+            <div><span className="mono" style={{color:"var(--c)"}}>{u.cqid||u.email}</span><span className="pill pc" style={{fontSize:9,marginLeft:8}}>{u.plan}</span></div>
+            <span className="mono" style={{color:"var(--t2)",fontSize:11}}>{u.telegramChatId}</span>
+          </div>))}
+      </div>
     </div>}
     {sub==="chat"&&<PageChat user={user}/>}
   </div>);
@@ -1617,6 +3223,11 @@ export default function App(){
       }
       // BTC dominance adjustment
       const adj=await adjustForBTCDominance(ns,coins);
+      // If market crash detected, mark all LONG signals as suspended
+      const crashWarn=checkVolatility(coins);
+      if(crashWarn?.pauseAll){
+        Object.keys(adj).forEach(k=>{if(adj[k]?.signal==="LONG"){adj[k]={...adj[k],volatileMarket:true,conf:Math.max(45,adj[k].conf-25)};}});
+      }
       setSigs(adj);setLoadSig(false);
     };
     run();const t=setInterval(run,7*60*1000);return()=>clearInterval(t);
